@@ -6,9 +6,8 @@ import multer from "multer";
 import ExcelJS from "exceljs";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import type mysql from "mysql2/promise";
 import { requireAuth, requireRole, signToken } from "./auth.js";
-import { initDatabase, pool } from "./db.js";
+import { initDatabase, query, withTransaction } from "./db.js";
 import { assertAllowedSupplierLink, assertRequiredText, parsePositiveInt } from "./validators.js";
 
 const app = express();
@@ -47,7 +46,10 @@ app.get("/api/health", (_req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   const email = String(req.body.email ?? "").trim().toLowerCase();
   const password = String(req.body.password ?? "");
-  const [rows] = await pool.query<mysql.RowDataPacket[]>("SELECT * FROM users WHERE email = ?", [email]);
+  const rows = await query<{ id: number; name: string; email: string; password_hash: string; role: "professor" | "coordenacao" }>(
+    "SELECT id, name, email, password_hash, role FROM dbo.users WHERE email = @email",
+    { email },
+  );
   const user = rows[0];
 
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
@@ -64,21 +66,21 @@ app.get("/api/me", requireAuth, (req, res) => {
 });
 
 app.get("/api/cost-centers", requireAuth, async (_req, res) => {
-  const [rows] = await pool.query("SELECT id, code, name FROM cost_centers ORDER BY code");
+  const rows = await query("SELECT id, code, name FROM dbo.cost_centers ORDER BY code");
   res.json(rows);
 });
 
 app.get("/api/catalog", requireAuth, async (req, res) => {
   const search = String(req.query.search ?? "").trim();
   const like = `%${search}%`;
-  const [rows] = await pool.query(
-    `SELECT ci.id, ci.code, ci.description, ci.source, cc.code as costCenterCode, cc.name as costCenterName
-     FROM catalog_items ci
-     LEFT JOIN cost_centers cc ON cc.id = ci.cost_center_id
-     WHERE ? = '' OR ci.code LIKE ? OR ci.description LIKE ?
-     ORDER BY ci.description
-     LIMIT 40`,
-    [search, like, like],
+  const rows = await query(
+    `SELECT TOP (40) ci.id, ci.code, ci.description, ci.source,
+            cc.code AS costCenterCode, cc.name AS costCenterName
+     FROM dbo.catalog_items ci
+     LEFT JOIN dbo.cost_centers cc ON cc.id = ci.cost_center_id
+     WHERE @search = N'' OR ci.code LIKE @like OR ci.description LIKE @like
+     ORDER BY ci.description`,
+    { search, like },
   );
   res.json(rows);
 });
@@ -100,37 +102,34 @@ app.post("/api/catalog/import", requireAuth, requireRole("coordenacao"), upload.
     return;
   }
 
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-    await connection.query("UPDATE purchase_requests SET catalog_item_id = NULL WHERE catalog_item_id IS NOT NULL");
-    await connection.query("DELETE FROM catalog_items");
-    for (const item of items) {
-      await connection.query("INSERT INTO catalog_items (code, description, source) VALUES (?, ?, 'planilha')", [
-        item.code,
-        item.description,
-      ]);
-    }
-    await connection.commit();
+    await withTransaction(async (transaction) => {
+      await query("UPDATE dbo.purchase_requests SET catalog_item_id = NULL WHERE catalog_item_id IS NOT NULL", {}, transaction);
+      await query("DELETE FROM dbo.catalog_items", {}, transaction);
+      for (const item of items) {
+        await query(
+          "INSERT INTO dbo.catalog_items (code, description, source) VALUES (@code, @description, N'planilha')",
+          item,
+          transaction,
+        );
+      }
+    });
     res.json({ imported: items.length });
   } catch (error) {
-    await connection.rollback();
     throw error;
-  } finally {
-    connection.release();
   }
 });
 
 app.get("/api/requests", requireAuth, async (req, res) => {
-  const filter = req.user?.role === "professor" ? "WHERE pr.professor_id = ?" : "";
-  const params = req.user?.role === "professor" ? [req.user.id] : [];
-  const [rows] = await pool.query(
+  const filter = req.user?.role === "professor" ? "WHERE pr.professor_id = @professorId" : "";
+  const params = req.user?.role === "professor" ? { professorId: req.user.id } : {};
+  const rows = await query(
     `SELECT pr.*, u.name as professorName, ci.code as catalogCode, ci.description as catalogDescription,
             cc.code as costCenterCode, cc.name as costCenterName
-     FROM purchase_requests pr
-     JOIN users u ON u.id = pr.professor_id
-     LEFT JOIN catalog_items ci ON ci.id = pr.catalog_item_id
-     JOIN cost_centers cc ON cc.id = pr.cost_center_id
+     FROM dbo.purchase_requests pr
+     JOIN dbo.users u ON u.id = pr.professor_id
+     LEFT JOIN dbo.catalog_items ci ON ci.id = pr.catalog_item_id
+     JOIN dbo.cost_centers cc ON cc.id = pr.cost_center_id
      ${filter}
      ORDER BY pr.created_at DESC`,
     params,
@@ -149,15 +148,16 @@ app.post(
       const quantity = parsePositiveInt(req.body.quantity, "Quantidade");
       const justification = assertRequiredText(req.body.justification, "Justificativa");
 
-      const [result] = await pool.query<mysql.ResultSetHeader>(
-        `INSERT INTO purchase_requests
+      const result = await query<{ id: number }>(
+        `INSERT INTO dbo.purchase_requests
          (professor_id, catalog_item_id, cost_center_id, item_type, quantity, justification, status)
-         VALUES (?, ?, ?, 'catalogo', ?, ?, 'aguardando_coordenacao')`,
-        [req.user?.id, catalogItemId, costCenterId, quantity, justification],
+         OUTPUT INSERTED.id
+         VALUES (@professorId, @catalogItemId, @costCenterId, 'catalogo', @quantity, @justification, 'aguardando_coordenacao')`,
+        { professorId: req.user?.id, catalogItemId, costCenterId, quantity, justification },
       );
 
       res.status(201).json({
-        id: result.insertId,
+        id: result[0].id,
         message: "Solicitacao enviada. Aguarde retorno em ate 30 dias.",
       });
     } catch (error) {
@@ -183,20 +183,23 @@ app.post(
       const newItemDescription = assertRequiredText(req.body.newItemDescription, "Descricao do produto");
       const supplierLink = assertAllowedSupplierLink(req.body.supplierLink);
 
-      const [result] = await pool.query<mysql.ResultSetHeader>(
-        `INSERT INTO purchase_requests
+      const result = await query<{ id: number }>(
+        `INSERT INTO dbo.purchase_requests
          (professor_id, cost_center_id, item_type, quantity, justification, new_item_name,
           new_item_description, supplier_link, status)
-         VALUES (?, ?, 'novo', ?, ?, ?, ?, ?, 'novo_item_pendente')`,
-        [req.user?.id, costCenterId, quantity, justification, newItemName, newItemDescription, supplierLink],
+         OUTPUT INSERTED.id
+         VALUES (@professorId, @costCenterId, 'novo', @quantity, @justification,
+                 @newItemName, @newItemDescription, @supplierLink, 'novo_item_pendente')`,
+        { professorId: req.user?.id, costCenterId, quantity, justification, newItemName, newItemDescription, supplierLink },
       );
 
+      const requestId = result[0].id;
       const files = req.files as Record<string, Express.Multer.File[]>;
-      await saveAttachment(result.insertId, files?.technicalFile?.[0], "ficha_tecnica");
-      await saveAttachment(result.insertId, files?.photo?.[0], "foto");
+      await saveAttachment(requestId, files?.technicalFile?.[0], "ficha_tecnica");
+      await saveAttachment(requestId, files?.photo?.[0], "foto");
 
       res.status(201).json({
-        id: result.insertId,
+        id: requestId,
         message: "Solicitacao de novo item enviada para a coordenacao.",
       });
     } catch (error) {
@@ -216,66 +219,88 @@ app.patch("/api/requests/:id/review", requireAuth, requireRole("coordenacao"), a
     return;
   }
 
-  const connection = await pool.getConnection();
-  try {
-    await connection.beginTransaction();
-    const [requests] = await connection.query<mysql.RowDataPacket[]>("SELECT * FROM purchase_requests WHERE id = ?", [id]);
+  const found = await withTransaction(async (transaction) => {
+    const requests = await query<{
+      professor_id: number;
+      item_type: "catalogo" | "novo";
+      catalog_item_id: number | null;
+      cost_center_id: number;
+      new_item_name: string | null;
+      new_item_description: string | null;
+    }>("SELECT * FROM dbo.purchase_requests WHERE id = @id", { id }, transaction);
     const request = requests[0];
-    if (!request) {
-      res.status(404).json({ message: "Solicitacao nao encontrada." });
-      return;
-    }
+    if (!request) return false;
 
     if (status === "aprovada" && request.item_type === "novo" && !request.catalog_item_id) {
       const code = `NOVO-${String(id).padStart(5, "0")}`;
-      const [catalogResult] = await connection.query<mysql.ResultSetHeader>(
-        "INSERT INTO catalog_items (code, description, cost_center_id, source) VALUES (?, ?, ?, 'coordenacao')",
-        [code, request.new_item_description ?? request.new_item_name, request.cost_center_id],
+      const catalogResult = await query<{ id: number }>(
+        `INSERT INTO dbo.catalog_items (code, description, cost_center_id, source)
+         OUTPUT INSERTED.id
+         VALUES (@code, @description, @costCenterId, N'coordenacao')`,
+        {
+          code,
+          description: request.new_item_description ?? request.new_item_name,
+          costCenterId: request.cost_center_id,
+        },
+        transaction,
       );
-      await connection.query("UPDATE purchase_requests SET catalog_item_id = ? WHERE id = ?", [catalogResult.insertId, id]);
+      await query(
+        "UPDATE dbo.purchase_requests SET catalog_item_id = @catalogItemId WHERE id = @id",
+        { catalogItemId: catalogResult[0].id, id },
+        transaction,
+      );
     }
 
-    await connection.query("UPDATE purchase_requests SET status = ?, coordinator_response = ? WHERE id = ?", [
-      status,
-      response,
-      id,
-    ]);
-    await connection.query("INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)", [
-      request.professor_id,
-      "Retorno da coordenacao",
-      `Sua solicitacao #${id} foi atualizada para: ${status}. ${response}`,
-    ]);
-    await connection.commit();
-    res.json({ message: "Retorno registrado e professor notificado." });
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
+    await query(
+      `UPDATE dbo.purchase_requests
+       SET status = @status, coordinator_response = @response, updated_at = SYSDATETIME()
+       WHERE id = @id`,
+      { status, response, id },
+      transaction,
+    );
+    await query(
+      `INSERT INTO dbo.notifications (user_id, title, message)
+       VALUES (@userId, @title, @message)`,
+      {
+        userId: request.professor_id,
+        title: "Retorno da coordenacao",
+        message: `Sua solicitacao #${id} foi atualizada para: ${status}. ${response}`,
+      },
+      transaction,
+    );
+    return true;
+  });
+
+  if (!found) {
+    res.status(404).json({ message: "Solicitacao nao encontrada." });
+    return;
   }
+
+  res.json({ message: "Retorno registrado e professor notificado." });
 });
 
 app.get("/api/notifications", requireAuth, async (req, res) => {
-  const [rows] = await pool.query(
-    "SELECT id, title, message, read_at as readAt, created_at as createdAt FROM notifications WHERE user_id = ? ORDER BY created_at DESC",
-    [req.user?.id],
+  const rows = await query(
+    `SELECT id, title, message, read_at AS readAt, created_at AS createdAt
+     FROM dbo.notifications WHERE user_id = @userId ORDER BY created_at DESC`,
+    { userId: req.user?.id },
   );
   res.json(rows);
 });
 
 app.patch("/api/notifications/read-all", requireAuth, async (req, res) => {
-  await pool.query(
-    "UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = ? AND read_at IS NULL",
-    [req.user?.id],
+  await query(
+    "UPDATE dbo.notifications SET read_at = SYSDATETIME() WHERE user_id = @userId AND read_at IS NULL",
+    { userId: req.user?.id },
   );
   res.json({ ok: true });
 });
 
 app.patch("/api/notifications/:id/read", requireAuth, async (req, res) => {
-  await pool.query("UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?", [
-    req.params.id,
-    req.user?.id,
-  ]);
+  await query(
+    "UPDATE dbo.notifications SET read_at = SYSDATETIME() WHERE id = @id AND user_id = @userId",
+    { id: req.params.id, userId: req.user?.id },
+  );
   res.json({ ok: true });
 });
 
@@ -327,9 +352,10 @@ function isAllowedDevOrigin(origin: string) {
 
 async function saveAttachment(requestId: number, file: Express.Multer.File | undefined, kind: "ficha_tecnica" | "foto") {
   if (!file) return;
-  await pool.query(
-    "INSERT INTO request_attachments (request_id, kind, original_name, stored_path) VALUES (?, ?, ?, ?)",
-    [requestId, kind, file.originalname, file.filename],
+  await query(
+    `INSERT INTO dbo.request_attachments (request_id, kind, original_name, stored_path)
+     VALUES (@requestId, @kind, @originalName, @storedPath)`,
+    { requestId, kind, originalName: file.originalname, storedPath: file.filename },
   );
 }
 

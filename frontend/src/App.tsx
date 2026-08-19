@@ -14,6 +14,7 @@ import {
   History,
   Home,
   LogOut,
+  Menu,
   PackagePlus,
   Printer,
   RotateCcw,
@@ -239,6 +240,7 @@ function Shell({
 }) {
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const notificationsRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -255,6 +257,17 @@ function Shell({
 
   const unread = notifications.filter((item) => !item.readAt).length
   const pageTitle = getPageTitle(activeView, user.role)
+  const navigationItems: Array<{ view: AppView; label: string; icon: React.ReactNode }> = user.role === 'professor'
+    ? [
+        { view: 'overview', label: 'Visão geral', icon: <Home size={18} /> },
+        { view: 'new-request', label: 'Nova solicitação', icon: <PackagePlus size={18} /> },
+        { view: 'requests', label: 'Minhas solicitações', icon: <History size={18} /> },
+      ]
+    : [
+        { view: 'overview', label: 'Visão geral', icon: <Home size={18} /> },
+        { view: 'catalog', label: 'Catálogo', icon: <FileSpreadsheet size={18} /> },
+        { view: 'queue', label: 'Fila de solicitações', icon: <ClipboardList size={18} /> },
+      ]
 
   async function markNotificationRead(id: number) {
     await api(token, `/notifications/${id}/read`, { method: 'PATCH' })
@@ -272,55 +285,43 @@ function Shell({
   function navigate(view: AppView) {
     onNavigate(view)
     setNotificationsOpen(false)
+    setMobileMenuOpen(false)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
   return (
     <main className="app-shell">
-      <aside className="sidebar">
-        <BrandMark compact onClick={() => navigate('overview')} />
-        <nav className="sidebar-nav" aria-label="Navegação principal">
-          <button className={activeView === 'overview' ? 'active' : ''} onClick={() => navigate('overview')} type="button">
-            <Home size={19} /> Visão geral
+      <header className="site-header">
+        <div className="site-header-inner">
+          <BrandMark compact onClick={() => navigate('overview')} />
+          <button
+            aria-controls="primary-navigation"
+            aria-expanded={mobileMenuOpen}
+            aria-label={mobileMenuOpen ? 'Fechar menu' : 'Abrir menu'}
+            className="menu-toggle"
+            onClick={() => setMobileMenuOpen((open) => !open)}
+            type="button"
+          >
+            <Menu size={22} />
           </button>
-          {user.role === 'professor' ? (
-            <>
-              <button className={activeView === 'new-request' ? 'active' : ''} onClick={() => navigate('new-request')} type="button">
-                <PackagePlus size={19} /> Nova solicitação
+          <nav
+            aria-label="Navegação principal"
+            className={mobileMenuOpen ? 'top-nav open' : 'top-nav'}
+            id="primary-navigation"
+          >
+            {navigationItems.map((item) => (
+              <button
+                className={activeView === item.view ? 'active' : ''}
+                key={item.view}
+                onClick={() => navigate(item.view)}
+                type="button"
+              >
+                {item.icon}
+                {item.label}
               </button>
-              <button className={activeView === 'requests' ? 'active' : ''} onClick={() => navigate('requests')} type="button">
-                <History size={19} /> Minhas solicitações
-              </button>
-            </>
-          ) : (
-            <>
-              <button className={activeView === 'catalog' ? 'active' : ''} onClick={() => navigate('catalog')} type="button">
-                <FileSpreadsheet size={19} /> Catálogo
-              </button>
-              <button className={activeView === 'queue' ? 'active' : ''} onClick={() => navigate('queue')} type="button">
-                <ClipboardList size={19} /> Fila de solicitações
-              </button>
-            </>
-          )}
-        </nav>
-        <div className="sidebar-footer">
-          <span className="avatar">{user.name.charAt(0).toUpperCase()}</span>
-          <div>
-            <strong>{user.name}</strong>
-            <span>{user.role === 'professor' ? 'Professor' : 'Coordenação'}</span>
-          </div>
-          <button className="icon-button" onClick={onLogout} title="Sair" type="button">
-            <LogOut size={18} />
-          </button>
-        </div>
-      </aside>
-      <div className="shell-content">
-        <header className="topbar">
-          <div>
-            <p className="eyebrow">Sistema de compras</p>
-            <h1>{pageTitle}</h1>
-          </div>
-          <div className="topbar-actions">
+            ))}
+          </nav>
+          <div className="header-actions">
             <div className="notifications-menu" ref={notificationsRef}>
               <button
                 aria-expanded={notificationsOpen}
@@ -341,10 +342,28 @@ function Shell({
                 />
               )}
             </div>
-            <button className="mobile-logout" onClick={onLogout} type="button"><LogOut size={17} /> Sair</button>
+            <div className="user-summary">
+              <span className="avatar">{user.name.charAt(0).toUpperCase()}</span>
+              <div>
+                <strong>{user.name}</strong>
+                <span>{user.role === 'professor' ? 'Professor' : 'Coordenação'}</span>
+              </div>
+            </div>
+            <button className="logout-button" onClick={onLogout} title="Sair" type="button">
+              <LogOut size={18} />
+              <span>Sair</span>
+            </button>
+          </div>
+        </div>
+      </header>
+      <div className="shell-content">
+        <header className="page-header">
+          <div>
+            <p className="eyebrow">Sistema de compras</p>
+            <h1>{pageTitle}</h1>
           </div>
         </header>
-        {children}
+        <div className="page-content">{children}</div>
       </div>
     </main>
   )
@@ -815,28 +834,44 @@ function CoordinatorDashboard({
 
   if (activeView === 'catalog') {
     return (
-      <section className="workspace-section page-section narrow-page">
-        <div className="section-heading">
-          <Upload size={22} />
-          <div>
-            <h2>Importar catalogo</h2>
-            <p className="muted">Envie uma planilha XLSX ou CSV com codigo e descricao.</p>
+      <div className="catalog-page">
+        <section className="workspace-section catalog-import-card">
+          <div className="section-heading">
+            <Upload size={22} />
+            <div>
+              <h2>Importar catálogo</h2>
+              <p className="muted">Envie uma planilha XLSX ou CSV com código e descrição.</p>
+            </div>
           </div>
-        </div>
-        <form className="form-stack" onSubmit={importCatalog}>
-          <input accept=".xlsx,.csv" name="file" required type="file" />
-          {importMessage && <p className="alert success">{importMessage}</p>}
-          <button className="primary-action" type="submit">
-            <Upload size={18} />
-            Substituir catalogo
-          </button>
-        </form>
-      </section>
+          <form className="form-stack catalog-import-form" onSubmit={importCatalog}>
+            <input accept=".xlsx,.csv" name="file" required type="file" />
+            {importMessage && <p className="alert success">{importMessage}</p>}
+            <button className="primary-action" type="submit">
+              <Upload size={18} />
+              Substituir catálogo
+            </button>
+          </form>
+        </section>
+        <section className="workspace-section catalog-future-panel">
+          <div className="section-heading">
+            <Database size={22} />
+            <div>
+              <h2>Itens do catálogo</h2>
+              <p className="muted">Espaço preparado para a futura gestão dos itens importados.</p>
+            </div>
+          </div>
+          <div className="catalog-placeholder">
+            <FileSpreadsheet size={28} />
+            <strong>Catálogo centralizado</strong>
+            <p>Após a importação, os itens ficam disponíveis para consulta nas solicitações dos professores.</p>
+          </div>
+        </section>
+      </div>
     )
   }
 
   return (
-      <section className="workspace-section page-section">
+      <section className="workspace-section queue-page">
         <div className="section-heading">
           <ClipboardList size={22} />
           <div>
@@ -845,6 +880,7 @@ function CoordinatorDashboard({
           </div>
         </div>
         <div className="request-stack">
+          {requests.length === 0 && <p className="empty-state">Nenhuma solicitação na fila no momento.</p>}
           {requests.map((request) => (
             <ReviewCard key={request.id} request={request} token={token} onReviewed={() => setRefreshKey((value) => value + 1)} />
           ))}
