@@ -1,0 +1,31 @@
+:root {
+  font-family: "Manrope Variable", Manrope, "Segoe UI", Arial, sans-serif;
+  color: #152d4f;
+  background: #f3f6f9;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+h1, h2, h3, strong {
+  text-wrap: pretty;
+}
+
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 3px solid rgba(245, 130, 32, 0.42);
+  outline-offset: 2px;
+}
+
+a {
+  color: #005ca9;
+  font-weight: 700;
+}
