@@ -61,8 +61,106 @@ app.post("/api/auth/login", async (req, res) => {
   res.json({ token: signToken(authUser), user: authUser });
 });
 
-app.get("/api/me", requireAuth, (req, res) => {
-  res.json({ user: req.user });
+app.get("/api/me", requireAuth, async (req, res) => {
+  const rows = await query<{ id: number; name: string; email: string; role: "professor" | "coordenacao" }>(
+    "SELECT id, name, email, role FROM dbo.users WHERE id = @userId",
+    { userId: req.user?.id },
+  );
+  const user = rows[0];
+
+  if (!user) {
+    res.status(404).json({ message: "Usuario nao encontrado." });
+    return;
+  }
+
+  res.json({ user });
+});
+
+app.patch("/api/me", requireAuth, async (req, res) => {
+  const name = String(req.body.name ?? "").trim();
+  const email = String(req.body.email ?? "").trim().toLowerCase();
+
+  if (!name || !email) {
+    res.status(400).json({ message: "Preencha os campos obrigatorios." });
+    return;
+  }
+  if (name.length > 120) {
+    res.status(400).json({ message: "O nome deve ter no maximo 120 caracteres." });
+    return;
+  }
+  if (email.length > 160 || !isValidEmail(email)) {
+    res.status(400).json({ message: "Informe um e-mail valido." });
+    return;
+  }
+
+  const duplicated = await query<{ id: number }>(
+    "SELECT id FROM dbo.users WHERE email = @email AND id <> @userId",
+    { email, userId: req.user?.id },
+  );
+  if (duplicated.length > 0) {
+    res.status(409).json({ message: "Este e-mail ja esta em uso." });
+    return;
+  }
+
+  try {
+    const rows = await query<{ id: number; name: string; email: string; role: "professor" | "coordenacao" }>(
+      `UPDATE dbo.users
+       SET name = @name, email = @email
+       OUTPUT INSERTED.id, INSERTED.name, INSERTED.email, INSERTED.role
+       WHERE id = @userId`,
+      { name, email, userId: req.user?.id },
+    );
+    const user = rows[0];
+
+    if (!user) {
+      res.status(404).json({ message: "Usuario nao encontrado." });
+      return;
+    }
+
+    res.json({ message: "Perfil atualizado com sucesso.", user, token: signToken(user) });
+  } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      res.status(409).json({ message: "Este e-mail ja esta em uso." });
+      return;
+    }
+    throw error;
+  }
+});
+
+app.patch("/api/me/password", requireAuth, async (req, res) => {
+  const currentPassword = String(req.body.currentPassword ?? "");
+  const newPassword = String(req.body.newPassword ?? "");
+
+  if (!currentPassword || !newPassword) {
+    res.status(400).json({ message: "Preencha os campos obrigatorios." });
+    return;
+  }
+  if (newPassword.length < 8) {
+    res.status(400).json({ message: "A nova senha deve ter no minimo 8 caracteres." });
+    return;
+  }
+
+  const rows = await query<{ password_hash: string }>(
+    "SELECT password_hash FROM dbo.users WHERE id = @userId",
+    { userId: req.user?.id },
+  );
+  const user = rows[0];
+
+  if (!user) {
+    res.status(404).json({ message: "Usuario nao encontrado." });
+    return;
+  }
+  if (!(await bcrypt.compare(currentPassword, user.password_hash))) {
+    res.status(400).json({ message: "Senha atual incorreta." });
+    return;
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  await query(
+    "UPDATE dbo.users SET password_hash = @passwordHash WHERE id = @userId",
+    { passwordHash, userId: req.user?.id },
+  );
+  res.json({ message: "Senha alterada com sucesso." });
 });
 
 app.get("/api/cost-centers", requireAuth, async (_req, res) => {
@@ -308,6 +406,18 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
   console.error(error);
   res.status(500).json({ message: "Erro interno do servidor." });
 });
+
+function isValidEmail(email: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function isUniqueConstraintError(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+
+  const sqlError = error as { number?: number; originalError?: { info?: { number?: number } } };
+  const number = sqlError.number ?? sqlError.originalError?.info?.number;
+  return number === 2601 || number === 2627;
+}
 
 function normalizeCatalogRow(row: Record<string, unknown>) {
   const entries = Object.entries(row).reduce<Record<string, string>>((acc, [key, value]) => {

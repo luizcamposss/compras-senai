@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowRight,
   Bell,
   Check,
   CheckCircle2,
   CheckCheck,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   ClipboardList,
@@ -20,24 +21,22 @@ import {
   RotateCcw,
   Search,
   Send,
+  Settings,
   ShieldCheck,
   Upload,
   TicketCheck,
   XCircle,
+  User,
 } from 'lucide-react'
 import './App.css'
+import { ProfileView, type ProfileUser } from './ProfileView'
 
 const API_URL = import.meta.env.VITE_API_URL ?? `http://${window.location.hostname}:3333/api`
 
 type Role = 'professor' | 'coordenacao'
-type AppView = 'overview' | 'new-request' | 'requests' | 'catalog' | 'queue'
+type AppView = 'overview' | 'new-request' | 'requests' | 'catalog' | 'queue' | 'profile' | 'settings'
 
-type User = {
-  id: number
-  name: string
-  email: string
-  role: Role
-}
+type User = ProfileUser
 
 type CatalogItem = {
   id: number
@@ -113,13 +112,29 @@ function App() {
     setUser(null)
   }
 
+  const handleSessionUpdate = useCallback((nextUser: User, nextToken = token) => {
+    localStorage.setItem('compras_token', nextToken)
+    localStorage.setItem('compras_user', JSON.stringify(nextUser))
+    setToken(nextToken)
+    setUser(nextUser)
+  }, [token])
+
   if (!token || !user) {
     return <LoginPage onLogin={handleLogin} />
   }
 
   return (
     <Shell activeView={activeView} user={user} token={token} onNavigate={setActiveView} onLogout={handleLogout}>
-      {user.role === 'professor' ? (
+      {activeView === 'profile' ? (
+        <ProfileView
+          apiUrl={API_URL}
+          token={token}
+          user={user}
+          onSessionUpdate={handleSessionUpdate}
+        />
+      ) : activeView === 'settings' ? (
+        <AccountFutureView view="settings" />
+      ) : user.role === 'professor' ? (
         <ProfessorDashboard activeView={activeView} token={token} onNavigate={setActiveView} />
       ) : (
         <CoordinatorDashboard activeView={activeView} token={token} onNavigate={setActiveView} />
@@ -240,23 +255,28 @@ function Shell({
 }) {
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const [userMenuOpen, setUserMenuOpen] = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const notificationsRef = useRef<HTMLDivElement>(null)
+  const userMenuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     api<Notification[]>(token, '/notifications').then(setNotifications).catch(() => setNotifications([]))
   }, [token])
 
   useEffect(() => {
-    function closeNotifications(event: MouseEvent) {
-      if (!notificationsRef.current?.contains(event.target as Node)) setNotificationsOpen(false)
+    function closeHeaderMenus(event: MouseEvent) {
+      const target = event.target as Node
+      if (!notificationsRef.current?.contains(target)) setNotificationsOpen(false)
+      if (!userMenuRef.current?.contains(target)) setUserMenuOpen(false)
     }
-    document.addEventListener('mousedown', closeNotifications)
-    return () => document.removeEventListener('mousedown', closeNotifications)
+    document.addEventListener('mousedown', closeHeaderMenus)
+    return () => document.removeEventListener('mousedown', closeHeaderMenus)
   }, [])
 
   const unread = notifications.filter((item) => !item.readAt).length
   const pageTitle = getPageTitle(activeView, user.role)
+  const roleLabel = user.role === 'professor' ? 'Professor' : 'Coordenação'
   const navigationItems: Array<{ view: AppView; label: string; icon: React.ReactNode }> = user.role === 'professor'
     ? [
         { view: 'overview', label: 'Visão geral', icon: <Home size={18} /> },
@@ -285,6 +305,7 @@ function Shell({
   function navigate(view: AppView) {
     onNavigate(view)
     setNotificationsOpen(false)
+    setUserMenuOpen(false)
     setMobileMenuOpen(false)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
@@ -299,7 +320,11 @@ function Shell({
             aria-expanded={mobileMenuOpen}
             aria-label={mobileMenuOpen ? 'Fechar menu' : 'Abrir menu'}
             className="menu-toggle"
-            onClick={() => setMobileMenuOpen((open) => !open)}
+            onClick={() => {
+              setMobileMenuOpen((open) => !open)
+              setUserMenuOpen(false)
+              setNotificationsOpen(false)
+            }}
             type="button"
           >
             <Menu size={22} />
@@ -327,7 +352,10 @@ function Shell({
                 aria-expanded={notificationsOpen}
                 aria-haspopup="true"
                 className={notificationsOpen ? 'notification-trigger active' : 'notification-trigger'}
-                onClick={() => setNotificationsOpen((open) => !open)}
+                onClick={() => {
+                  setNotificationsOpen((open) => !open)
+                  setUserMenuOpen(false)
+                }}
                 title="Notificações"
                 type="button"
               >
@@ -342,17 +370,50 @@ function Shell({
                 />
               )}
             </div>
-            <div className="user-summary">
-              <span className="avatar">{user.name.charAt(0).toUpperCase()}</span>
-              <div>
-                <strong>{user.name}</strong>
-                <span>{user.role === 'professor' ? 'Professor' : 'Coordenação'}</span>
-              </div>
+            <div className="user-menu" ref={userMenuRef}>
+              <button
+                aria-expanded={userMenuOpen}
+                aria-haspopup="menu"
+                className={userMenuOpen ? 'user-menu-trigger active' : 'user-menu-trigger'}
+                onClick={() => {
+                  setUserMenuOpen((open) => !open)
+                  setNotificationsOpen(false)
+                }}
+                type="button"
+              >
+                <span className="avatar">{user.name.charAt(0).toUpperCase()}</span>
+                <span className="user-menu-copy">
+                  <strong>{user.name}</strong>
+                  <small>{roleLabel}</small>
+                </span>
+                <ChevronDown className="user-menu-chevron" size={16} />
+              </button>
+              {userMenuOpen && (
+                <div className="user-menu-dropdown" role="menu">
+                  <button onClick={() => navigate('profile')} role="menuitem" type="button">
+                    <User size={17} />
+                    <span>Meu perfil</span>
+                  </button>
+                  <button onClick={() => navigate('settings')} role="menuitem" type="button">
+                    <Settings size={17} />
+                    <span>Configurações</span>
+                  </button>
+                  <div className="user-menu-separator" />
+                  <button
+                    className="user-menu-logout"
+                    onClick={() => {
+                      setUserMenuOpen(false)
+                      onLogout()
+                    }}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <LogOut size={17} />
+                    <span>Sair</span>
+                  </button>
+                </div>
+              )}
             </div>
-            <button className="logout-button" onClick={onLogout} title="Sair" type="button">
-              <LogOut size={18} />
-              <span>Sair</span>
-            </button>
           </div>
         </div>
       </header>
@@ -379,6 +440,22 @@ function BrandMark({ compact = false, onClick }: { compact?: boolean; onClick?: 
         width="824"
       />
     </a>
+  )
+}
+
+function AccountFutureView({ view }: { view: 'profile' | 'settings' }) {
+  const isProfile = view === 'profile'
+
+  return (
+    <section className="workspace-section account-future-page">
+      <span className="account-future-icon">
+        {isProfile ? <User size={24} /> : <Settings size={24} />}
+      </span>
+      <div>
+        <h2>{isProfile ? 'Meu perfil' : 'Configurações'}</h2>
+        <p>Esta área está preparada para uma próxima etapa do projeto.</p>
+      </div>
+    </section>
   )
 }
 
@@ -1098,6 +1175,8 @@ function getPageTitle(view: AppView, role: Role) {
     requests: 'Minhas solicitações',
     catalog: 'Catálogo',
     queue: 'Fila de solicitações',
+    profile: 'Meu perfil',
+    settings: 'Configurações',
   }
   if (role === 'professor' && (view === 'catalog' || view === 'queue')) return 'Visão geral'
   if (role === 'coordenacao' && (view === 'new-request' || view === 'requests')) return 'Visão geral'
