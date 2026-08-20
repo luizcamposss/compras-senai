@@ -78,6 +78,19 @@ type PurchaseRequest = {
   status: string
   coordinator_response?: string
   created_at: string
+  items: PurchaseRequestItem[]
+}
+
+type PurchaseRequestItem = {
+  id: number
+  requestId: number
+  item_type: 'catalogo' | 'novo'
+  quantity: number
+  catalogCode?: string
+  catalogDescription?: string
+  new_item_name?: string
+  new_item_description?: string
+  supplier_link?: string
 }
 
 type Notification = {
@@ -90,8 +103,7 @@ type Notification = {
 
 type RequestTicket = {
   id: number
-  item: string
-  quantity: string
+  items: Array<{ label: string; quantity: string }>
   costCenter: string
   status: 'aguardando_coordenacao' | 'novo_item_pendente'
   submittedAt: string
@@ -626,15 +638,18 @@ function DashboardOverview({
           </div>
           <div className="compact-request-list">
             {recentRequests.length === 0 && <p className="empty-state">Nenhuma solicitação registrada.</p>}
-            {recentRequests.map((request) => (
-              <article key={request.id}>
-                <div>
-                  <strong>#{request.id} · {request.item_type === 'catalogo' ? request.catalogCode : request.new_item_name}</strong>
-                  <span>{request.item_type === 'catalogo' ? request.catalogDescription : request.new_item_description}</span>
-                </div>
-                <StatusBadge status={request.status} />
-              </article>
-            ))}
+            {recentRequests.map((request) => {
+              const summary = getRequestSummary(request)
+              return (
+                <article key={request.id}>
+                  <div>
+                    <strong>#{request.id} · {summary.code}</strong>
+                    <span>{summary.name}</span>
+                  </div>
+                  <StatusBadge status={request.status} />
+                </article>
+              )
+            })}
           </div>
         </section>
       </div>
@@ -665,7 +680,7 @@ function PurchaseForm({
   const [search, setSearch] = useState('')
   const [items, setItems] = useState<CatalogItem[]>([])
   const [searchingItems, setSearchingItems] = useState(false)
-  const [selectedItem, setSelectedItem] = useState<CatalogItem | null>(null)
+  const [selectedItems, setSelectedItems] = useState<Array<CatalogItem & { quantity: string }>>([])
   const [form, setForm] = useState({
     quantity: '1',
     justification: '',
@@ -700,15 +715,31 @@ function PurchaseForm({
   const selectedCostCenter = costCenters.find((center) => String(center.id) === form.costCenterId)
 
   function validateForm() {
-    if (mode === 'catalog' && !selectedItem) return 'Selecione um item do catálogo.'
+    if (mode === 'catalog' && selectedItems.length === 0) return 'Adicione pelo menos um item do catálogo.'
+    if (mode === 'catalog' && selectedItems.some((item) => !isValidRequestQuantity(item.quantity))) {
+      return 'A quantidade de cada produto deve estar entre 1 e 50.'
+    }
     if (mode === 'new' && (!form.newItemName.trim() || !form.newItemDescription.trim() || !form.supplierLink.trim())) {
       return 'Preencha nome, descrição e link do novo produto.'
     }
     if (mode === 'new' && linkBlocked) return 'Links de Amazon, Shopee e Mercado Livre não são permitidos.'
-    if (!form.costCenterId || !form.justification.trim() || !Number.isInteger(Number(form.quantity)) || Number(form.quantity) < 1) {
-      return 'Preencha quantidade, centro de custo e justificativa.'
-    }
+    if (mode === 'new' && !isValidRequestQuantity(form.quantity)) return 'A quantidade deve estar entre 1 e 50.'
+    if (!form.costCenterId || !form.justification.trim()) return 'Preencha centro de custo e justificativa.'
     return ''
+  }
+
+  function addCatalogItem(item: CatalogItem) {
+    if (selectedItems.some((selected) => selected.id === item.id)) return
+    if (selectedItems.length >= 50) {
+      setError('Um pedido pode conter no máximo 50 produtos.')
+      return
+    }
+    setSelectedItems((current) => [...current, { ...item, quantity: '1' }])
+    setError('')
+  }
+
+  function updateCatalogItemQuantity(id: number, quantity: string) {
+    setSelectedItems((current) => current.map((item) => item.id === id ? { ...item, quantity } : item))
   }
 
   function reviewRequest() {
@@ -732,13 +763,11 @@ function PurchaseForm({
     try {
       let requestId: number
       if (mode === 'catalog') {
-        if (!selectedItem) throw new Error('Selecione um item do catalogo.')
         const response = await api<{ id: number; message: string }>(token, '/requests/catalog', {
           method: 'POST',
           body: JSON.stringify({
-            catalogItemId: selectedItem.id,
+            items: selectedItems.map((item) => ({ catalogItemId: item.id, quantity: item.quantity })),
             costCenterId: form.costCenterId,
-            quantity: form.quantity,
             justification: form.justification,
           }),
         })
@@ -759,8 +788,9 @@ function PurchaseForm({
 
       setTicket({
         id: requestId,
-        item: mode === 'catalog' ? `${selectedItem?.code} · ${selectedItem?.description}` : form.newItemName,
-          quantity: form.quantity,
+        items: mode === 'catalog'
+          ? selectedItems.map((item) => ({ label: `${item.code} · ${item.description}`, quantity: item.quantity }))
+          : [{ label: form.newItemName, quantity: form.quantity }],
           costCenter: selectedCostCenter ? `${selectedCostCenter.code} · ${selectedCostCenter.name}` : '-',
           status: mode === 'catalog' ? 'aguardando_coordenacao' : 'novo_item_pendente',
           submittedAt: new Date().toISOString(),
@@ -775,7 +805,7 @@ function PurchaseForm({
         supplierLink: '',
       })
       setSearch('')
-      setSelectedItem(null)
+      setSelectedItems([])
       setTechnicalFile(null)
       setPhoto(null)
       setReviewing(false)
@@ -824,22 +854,34 @@ function PurchaseForm({
                     Código ou nome
                     <div className="search-box">
                       <Search size={18} />
-                        <input value={search} onChange={(event) => { setSearch(event.target.value); setSelectedItem(null) }} placeholder="Digite para consultar o catálogo" />
+                        <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Digite para consultar o catálogo" />
                     </div>
                   </label>
+                    {selectedItems.length > 0 && (
+                      <div className="selected-items-card" aria-live="polite">
+                        <header><div><CheckCircle2 size={19} /><strong>Itens do pedido</strong></div><span>{selectedItems.length} {selectedItems.length === 1 ? 'produto' : 'produtos'}</span></header>
+                        {selectedItems.map((item) => (
+                          <div className="selected-order-item" key={item.id}>
+                            <div><strong>{item.code}</strong><span>{item.description}</span></div>
+                            <label>Quantidade<input aria-label={`Quantidade de ${item.description}`} max="50" min="1" onChange={(event) => updateCatalogItemQuantity(item.id, event.target.value)} type="number" value={item.quantity} /></label>
+                            <button aria-label={`Remover ${item.description}`} onClick={() => setSelectedItems((current) => current.filter((selected) => selected.id !== item.id))} title="Remover item" type="button"><XCircle size={18} /></button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     {searchingItems && <p className="field-hint">Buscando itens...</p>}
                     {!searchingItems && search.trim() && items.length === 0 && <p className="catalog-search-empty">Nenhum item encontrado.</p>}
                   {items.length > 0 && (
                     <div className="results-list">
                       {items.map((item) => (
-                        <button className={selectedItem?.id === item.id ? 'result-row selected' : 'result-row'} key={item.id} onClick={() => setSelectedItem(item)} type="button">
+                        <button className={selectedItems.some((selected) => selected.id === item.id) ? 'result-row selected' : 'result-row'} key={item.id} onClick={() => addCatalogItem(item)} type="button">
                           <span className="selection-indicator" />
                           <span><strong>{item.code}</strong><small>{item.description}</small></span>
+                          <small>{selectedItems.some((selected) => selected.id === item.id) ? 'Adicionado' : 'Adicionar'}</small>
                         </button>
                       ))}
                     </div>
                   )}
-                    {selectedItem && <p className="selected-item-summary"><CheckCircle2 size={16} /> Item selecionado: <strong>{selectedItem.code}</strong></p>}
                 </div>
               ) : (
                 <div className="step-fields">
@@ -857,8 +899,8 @@ function PurchaseForm({
                   <div><h3>Detalhes da compra</h3><p>Informe quanto precisa, o centro de custo e a justificativa.</p></div>
                 </div>
                 <div className="step-fields">
-              <div className="two-columns">
-                <label>Quantidade<input min="1" value={form.quantity} onChange={(event) => setFormValue(setForm, 'quantity', event.target.value)} type="number" /></label>
+              <div className={mode === 'new' ? 'two-columns' : 'step-fields'}>
+                {mode === 'new' && <label>Quantidade<input max="50" min="1" value={form.quantity} onChange={(event) => setFormValue(setForm, 'quantity', event.target.value)} type="number" /></label>}
                 <label>Centro de custo<select value={form.costCenterId} onChange={(event) => setFormValue(setForm, 'costCenterId', event.target.value)}><option value="">Selecione</option>{costCenters.map((center) => <option key={center.id} value={center.id}>{center.code} - {center.name}</option>)}</select></label>
               </div>
               <label>Justificativa<textarea value={form.justification} onChange={(event) => setFormValue(setForm, 'justification', event.target.value)} placeholder="Explique como o item será utilizado" /></label>
@@ -874,8 +916,12 @@ function PurchaseForm({
           ) : (
             <div className="review-summary">
               <dl>
-                <div><dt>Item</dt><dd>{mode === 'catalog' ? `${selectedItem?.code} · ${selectedItem?.description}` : form.newItemName}</dd></div>
-                <div><dt>Quantidade</dt><dd>{form.quantity}</dd></div>
+                <div className="full"><dt>{mode === 'catalog' ? 'Itens do pedido' : 'Item'}</dt><dd>
+                  {mode === 'catalog' ? (
+                    <span className="review-items-list">{selectedItems.map((item) => <span key={item.id}><strong>{item.quantity}×</strong> {item.code} · {item.description}</span>)}</span>
+                  ) : form.newItemName}
+                </dd></div>
+                {mode === 'new' && <div><dt>Quantidade</dt><dd>{form.quantity}</dd></div>}
                 <div><dt>Centro de custo</dt><dd>{selectedCostCenter ? `${selectedCostCenter.code} · ${selectedCostCenter.name}` : '-'}</dd></div>
                 <div className="full"><dt>Justificativa</dt><dd>{form.justification}</dd></div>
                 {mode === 'new' && <div className="full"><dt>Fornecedor</dt><dd>{form.supplierLink}</dd></div>}
@@ -929,8 +975,7 @@ function RequestTicketView({
 
       <dl className="ticket-details">
         <div><dt>Data de envio</dt><dd>{formatDateTime(ticket.submittedAt)}</dd></div>
-        <div><dt>Item solicitado</dt><dd>{ticket.item}</dd></div>
-        <div><dt>Quantidade</dt><dd>{ticket.quantity}</dd></div>
+        <div><dt>{ticket.items.length === 1 ? 'Item solicitado' : 'Itens solicitados'}</dt><dd className="ticket-items-list">{ticket.items.map((item, index) => <span key={`${item.label}-${index}`}><strong>{item.quantity}×</strong> {item.label}</span>)}</dd></div>
         <div><dt>Centro de custo</dt><dd>{ticket.costCenter}</dd></div>
         <div><dt>Status</dt><dd><StatusBadge status={ticket.status} /></dd></div>
       </dl>
@@ -1195,6 +1240,7 @@ function CatalogBrowser({ token, refreshKey }: { token: string; refreshKey: numb
 function ReviewCard({ request, token, onReviewed }: { request: PurchaseRequest; token: string; onReviewed: () => void }) {
   const [response, setResponse] = useState(request.coordinator_response ?? '')
   const [error, setError] = useState('')
+  const requestItems = getRequestItems(request)
 
   async function review(status: 'aprovada' | 'recusada' | 'ajuste_solicitado') {
     setError('')
@@ -1213,18 +1259,18 @@ function ReviewCard({ request, token, onReviewed }: { request: PurchaseRequest; 
     <article className="request-card">
       <div className="request-card-head">
         <div>
-          <strong>#{request.id} - {request.item_type === 'catalogo' ? request.catalogCode : request.new_item_name}</strong>
+          <strong>#{request.id} - {requestItems.length} {requestItems.length === 1 ? 'produto' : 'produtos'}</strong>
           <span>{request.professorName} | {request.costCenterCode} - {request.costCenterName}</span>
         </div>
         <StatusBadge status={request.status} />
       </div>
-      <p>{request.item_type === 'catalogo' ? request.catalogDescription : request.new_item_description}</p>
-      <p className="muted">Quantidade: {request.quantity} | Justificativa: {request.justification}</p>
-      {request.supplier_link && (
-        <a href={request.supplier_link} rel="noreferrer" target="_blank">
-          Link do fornecedor
-        </a>
-      )}
+      <div className="request-items-display">
+        {requestItems.map((item) => {
+          const display = getRequestItemDisplay(item, request.id)
+          return <div key={item.id}><strong>{item.quantity}× {display.code}</strong><span>{display.name}</span>{item.supplier_link && <a href={item.supplier_link} rel="noreferrer" target="_blank">Link do fornecedor</a>}</div>
+        })}
+      </div>
+      <p className="muted">Justificativa: {request.justification}</p>
       <textarea value={response} onChange={(event) => setResponse(event.target.value)} placeholder="Resposta da coordenacao" />
       {error && <p className="alert error">{error}</p>}
       <div className="review-actions">
@@ -1259,14 +1305,17 @@ function RequestList({ title, requests }: { title: string; requests: PurchaseReq
     const end = dateTo ? new Date(`${dateTo}T23:59:59`) : null
 
     return requests.filter((request) => {
-      const itemCode = request.item_type === 'catalogo' ? request.catalogCode : `NOVO-${request.id}`
-      const itemName = request.item_type === 'catalogo' ? request.catalogDescription : request.new_item_name
-      const matchesSearch = !normalizedSearch || [request.id, itemCode, itemName, request.costCenterCode]
+      const requestItems = getRequestItems(request)
+      const itemSearchValues = requestItems.flatMap((item) => {
+        const display = getRequestItemDisplay(item, request.id)
+        return [display.code, display.name]
+      })
+      const matchesSearch = !normalizedSearch || [request.id, request.costCenterCode, ...itemSearchValues]
         .some((value) => String(value ?? '').toLowerCase().includes(normalizedSearch))
       const createdAt = new Date(request.created_at)
       return matchesSearch
         && (status === 'all' || request.status === status)
-        && (type === 'all' || request.item_type === type)
+        && (type === 'all' || requestItems.some((item) => item.item_type === type))
         && (!start || createdAt >= start)
         && (!end || createdAt <= end)
     })
@@ -1321,21 +1370,21 @@ function RequestList({ title, requests }: { title: string; requests: PurchaseReq
         {filteredRequests.map((request) => {
           const expanded = expandedId === request.id
           const protocol = `SOL-${new Date(request.created_at).getFullYear()}-${String(request.id).padStart(6, '0')}`
-          const itemCode = request.item_type === 'catalogo' ? request.catalogCode ?? 'Sem código' : `NOVO-${request.id}`
-          const itemName = request.item_type === 'catalogo' ? request.catalogDescription ?? 'Item removido do catálogo' : request.new_item_name
+          const summary = getRequestSummary(request)
+          const requestItems = getRequestItems(request)
           return (
             <article className={expanded ? 'history-entry expanded' : 'history-entry'} key={request.id}>
               <button className="history-row" onClick={() => setExpandedId(expanded ? null : request.id)} type="button">
                 <span className="history-date"><strong>{formatShortDate(request.created_at)}</strong><small>{formatShortTime(request.created_at)}</small></span>
                 <strong className="history-protocol">{protocol}</strong>
-                <span className="history-item"><strong>{itemCode}</strong><small>{itemName}</small></span>
+                <span className="history-item"><strong>{summary.code}</strong><small>{summary.name}</small></span>
                 <StatusBadge status={request.status} />
                 <ChevronRight className="history-chevron" size={18} />
               </button>
               {expanded && (
                 <div className="history-details">
                   <dl>
-                    <div><dt>Quantidade</dt><dd>{request.quantity}</dd></div>
+                    <div className="full"><dt>Itens do pedido</dt><dd className="history-items-list">{requestItems.map((item) => { const display = getRequestItemDisplay(item, request.id); return <span key={item.id}><strong>{item.quantity}× {display.code}</strong> {display.name}</span> })}</dd></div>
                     <div><dt>Centro de custo</dt><dd>{request.costCenterCode} · {request.costCenterName}</dd></div>
                     <div className="full"><dt>Justificativa</dt><dd>{request.justification}</dd></div>
                     {request.coordinator_response && <div className="full response"><dt>Retorno da coordenação</dt><dd>{request.coordinator_response}</dd></div>}
@@ -1468,6 +1517,42 @@ function formatShortTime(value: string) {
     hour: '2-digit',
     minute: '2-digit',
   }).format(new Date(value))
+}
+
+function getRequestItems(request: PurchaseRequest) {
+  if (request.items?.length) return request.items
+  return [{
+    id: 0,
+    requestId: request.id,
+    item_type: request.item_type,
+    quantity: request.quantity,
+    catalogCode: request.catalogCode,
+    catalogDescription: request.catalogDescription,
+    new_item_name: request.new_item_name,
+    new_item_description: request.new_item_description,
+    supplier_link: request.supplier_link,
+  }]
+}
+
+function getRequestItemDisplay(item: PurchaseRequestItem, requestId: number) {
+  return {
+    code: item.item_type === 'catalogo' ? item.catalogCode ?? 'Sem código' : `NOVO-${requestId}`,
+    name: item.item_type === 'catalogo' ? item.catalogDescription ?? 'Item removido do catálogo' : item.new_item_name ?? 'Novo item',
+  }
+}
+
+function getRequestSummary(request: PurchaseRequest) {
+  const items = getRequestItems(request)
+  const first = getRequestItemDisplay(items[0], request.id)
+  return {
+    code: items.length > 1 ? `${first.code} +${items.length - 1}` : first.code,
+    name: items.length > 1 ? `${first.name} e mais ${items.length - 1} ${items.length === 2 ? 'produto' : 'produtos'}` : first.name,
+  }
+}
+
+function isValidRequestQuantity(value: string | number) {
+  const quantity = Number(value)
+  return Number.isInteger(quantity) && quantity >= 1 && quantity <= 50
 }
 
 function StatusBadge({ status }: { status: string }) {

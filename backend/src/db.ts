@@ -157,6 +157,34 @@ export async function initDatabase() {
       );
     END;
 
+    IF OBJECT_ID(N'dbo.purchase_request_items', N'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.purchase_request_items (
+        id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_purchase_request_items PRIMARY KEY,
+        request_id INT NOT NULL,
+        catalog_item_id INT NULL,
+        item_type VARCHAR(20) NOT NULL CONSTRAINT CK_purchase_request_items_type CHECK (item_type IN ('catalogo', 'novo')),
+        quantity INT NOT NULL CONSTRAINT CK_purchase_request_items_quantity CHECK (quantity > 0),
+        new_item_name NVARCHAR(180) NULL,
+        new_item_description NVARCHAR(MAX) NULL,
+        supplier_link NVARCHAR(MAX) NULL,
+        created_at DATETIME2 NOT NULL CONSTRAINT DF_purchase_request_items_created_at DEFAULT SYSDATETIME(),
+        CONSTRAINT FK_purchase_request_items_requests FOREIGN KEY (request_id)
+          REFERENCES dbo.purchase_requests(id) ON DELETE CASCADE,
+        CONSTRAINT FK_purchase_request_items_catalog FOREIGN KEY (catalog_item_id)
+          REFERENCES dbo.catalog_items(id)
+      );
+    END;
+
+    INSERT INTO dbo.purchase_request_items
+      (request_id, catalog_item_id, item_type, quantity, new_item_name, new_item_description, supplier_link)
+    SELECT pr.id, pr.catalog_item_id, pr.item_type, pr.quantity,
+           pr.new_item_name, pr.new_item_description, pr.supplier_link
+    FROM dbo.purchase_requests pr
+    WHERE NOT EXISTS (
+      SELECT 1 FROM dbo.purchase_request_items pri WHERE pri.request_id = pr.id
+    );
+
     IF OBJECT_ID(N'dbo.request_attachments', N'U') IS NULL
     BEGIN
       CREATE TABLE dbo.request_attachments (
