@@ -324,14 +324,20 @@ app.get("/api/cost-centers", requireAuth, async (_req, res) => {
 app.get("/api/catalog", requireAuth, async (req, res) => {
   const search = String(req.query.search ?? "").trim();
   const like = `%${search}%`;
+  const requestedLimit = Number(req.query.limit);
+  const requestedOffset = Number(req.query.offset);
+  const paginated = Number.isInteger(requestedLimit) || Number.isInteger(requestedOffset);
+  const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 200) : 40;
+  const offset = Number.isInteger(requestedOffset) ? Math.max(requestedOffset, 0) : 0;
   const rows = await query(
-    `SELECT TOP (40) ci.id, ci.code, ci.description, ci.source,
+    `SELECT ${paginated ? "" : "TOP (40)"} ci.id, ci.code, ci.description, ci.source,
             cc.code AS costCenterCode, cc.name AS costCenterName
      FROM dbo.catalog_items ci
      LEFT JOIN dbo.cost_centers cc ON cc.id = ci.cost_center_id
      WHERE @search = N'' OR ci.code LIKE @like OR ci.description LIKE @like
-     ORDER BY ci.description`,
-    { search, like },
+     ORDER BY ci.description, ci.id
+     ${paginated ? "OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY" : ""}`,
+    { search, like, offset, limit },
   );
   res.json(rows);
 });

@@ -660,10 +660,11 @@ function PurchaseForm({
   onCreated: () => void
   onViewRequests: () => void
 }) {
-  const [step, setStep] = useState(1)
+  const [reviewing, setReviewing] = useState(false)
   const [mode, setMode] = useState<'catalog' | 'new'>('catalog')
   const [search, setSearch] = useState('')
   const [items, setItems] = useState<CatalogItem[]>([])
+  const [searchingItems, setSearchingItems] = useState(false)
   const [selectedItem, setSelectedItem] = useState<CatalogItem | null>(null)
   const [form, setForm] = useState({
     quantity: '1',
@@ -677,14 +678,20 @@ function PurchaseForm({
   const [photo, setPhoto] = useState<File | null>(null)
   const [ticket, setTicket] = useState<RequestTicket | null>(null)
   const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
 
   useEffect(() => {
     if (!search.trim()) {
       setItems([])
+      setSearchingItems(false)
       return
     }
     const timeout = window.setTimeout(() => {
-      api<CatalogItem[]>(token, `/catalog?search=${encodeURIComponent(search)}`).then(setItems).catch(() => setItems([]))
+      setSearchingItems(true)
+      api<CatalogItem[]>(token, `/catalog?search=${encodeURIComponent(search)}`)
+        .then(setItems)
+        .catch(() => setItems([]))
+        .finally(() => setSearchingItems(false))
     }, 250)
     return () => window.clearTimeout(timeout)
   }, [search, token])
@@ -692,35 +699,35 @@ function PurchaseForm({
   const linkBlocked = useMemo(() => isBlockedLink(form.supplierLink), [form.supplierLink])
   const selectedCostCenter = costCenters.find((center) => String(center.id) === form.costCenterId)
 
-  function nextStep() {
-    setError('')
-
-    if (step === 1) {
-      if (mode === 'catalog' && !selectedItem) {
-        setError('Selecione um item do catálogo para continuar.')
-        return
-      }
-      if (mode === 'new' && (!form.newItemName.trim() || !form.newItemDescription.trim() || !form.supplierLink.trim())) {
-        setError('Preencha os dados do novo produto para continuar.')
-        return
-      }
-      if (mode === 'new' && linkBlocked) {
-        setError('Links de Amazon, Shopee e Mercado Livre não são permitidos.')
-        return
-      }
+  function validateForm() {
+    if (mode === 'catalog' && !selectedItem) return 'Selecione um item do catálogo.'
+    if (mode === 'new' && (!form.newItemName.trim() || !form.newItemDescription.trim() || !form.supplierLink.trim())) {
+      return 'Preencha nome, descrição e link do novo produto.'
     }
-
-    if (step === 2 && (!form.costCenterId || !form.justification.trim() || Number(form.quantity) < 1)) {
-      setError('Preencha quantidade, centro de custo e justificativa para continuar.')
-      return
+    if (mode === 'new' && linkBlocked) return 'Links de Amazon, Shopee e Mercado Livre não são permitidos.'
+    if (!form.costCenterId || !form.justification.trim() || !Number.isInteger(Number(form.quantity)) || Number(form.quantity) < 1) {
+      return 'Preencha quantidade, centro de custo e justificativa.'
     }
+    return ''
+  }
 
-    setStep((current) => Math.min(3, current + 1))
+  function reviewRequest() {
+    const validationError = validateForm()
+    setError(validationError)
+    if (!validationError) setReviewing(true)
   }
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
+    const validationError = validateForm()
+    if (validationError) {
+      setError(validationError)
+      setReviewing(false)
+      return
+    }
+
     setError('')
+    setSubmitting(true)
 
     try {
       let requestId: number
@@ -771,10 +778,12 @@ function PurchaseForm({
       setSelectedItem(null)
       setTechnicalFile(null)
       setPhoto(null)
-      setStep(1)
+      setReviewing(false)
       onCreated()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Nao foi possivel enviar a solicitacao.')
+    } finally {
+      setSubmitting(false)
     }
   }
 
@@ -789,32 +798,25 @@ function PurchaseForm({
   }
 
   return (
-    <section className="request-wizard page-section">
-      <ol className="wizard-steps" aria-label="Etapas da solicitação">
-        {['Escolher item', 'Informar detalhes', 'Revisar e enviar'].map((label, index) => {
-          const number = index + 1
-          return (
-            <li className={step === number ? 'active' : step > number ? 'complete' : ''} key={label}>
-              <span>{step > number ? <Check size={15} /> : number}</span>
-              <strong>{label}</strong>
-            </li>
-          )
-        })}
-      </ol>
-
+    <section className="request-form-page page-section">
       <form className="wizard-form" onSubmit={submit}>
         <header className="wizard-heading">
-          <span>Etapa {step} de 3</span>
-          <h2>{step === 1 ? 'Qual item você precisa?' : step === 2 ? 'Detalhes da solicitação' : 'Revise antes de enviar'}</h2>
-          <p>{step === 1 ? 'Consulte o catálogo ou sugira um produto novo.' : step === 2 ? 'Informe quantidade, destino e motivo da compra.' : 'Confira os dados e confirme o envio para a coordenação.'}</p>
+          <span>{reviewing ? 'Revisão final' : 'Formulário de compra'}</span>
+          <h2>{reviewing ? 'Revise antes de enviar' : 'Informe os dados da solicitação'}</h2>
+          <p>{reviewing ? 'Confira os dados abaixo. Se precisar, volte para corrigir o formulário.' : 'Escolha o item, informe a quantidade, o destino e o motivo da compra.'}</p>
         </header>
 
         <div className="wizard-body">
-          {step === 1 && (
-            <>
+          {!reviewing ? (
+            <div className="request-form-content">
+              <section className="request-form-section">
+                <div className="request-form-section-heading">
+                  <span>1</span>
+                  <div><h3>Item solicitado</h3><p>Selecione um produto do catálogo ou cadastre uma sugestão.</p></div>
+                </div>
               <div className="segmented">
-                <button className={mode === 'catalog' ? 'active' : ''} onClick={() => setMode('catalog')} type="button">Item do catálogo</button>
-                <button className={mode === 'new' ? 'active' : ''} onClick={() => setMode('new')} type="button">Item novo</button>
+                  <button className={mode === 'catalog' ? 'active' : ''} onClick={() => { setMode('catalog'); setError('') }} type="button">Item do catálogo</button>
+                  <button className={mode === 'new' ? 'active' : ''} onClick={() => { setMode('new'); setError('') }} type="button">Item novo</button>
               </div>
               {mode === 'catalog' ? (
                 <div className="step-fields">
@@ -822,9 +824,11 @@ function PurchaseForm({
                     Código ou nome
                     <div className="search-box">
                       <Search size={18} />
-                      <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Digite para consultar o catálogo" />
+                        <input value={search} onChange={(event) => { setSearch(event.target.value); setSelectedItem(null) }} placeholder="Digite para consultar o catálogo" />
                     </div>
                   </label>
+                    {searchingItems && <p className="field-hint">Buscando itens...</p>}
+                    {!searchingItems && search.trim() && items.length === 0 && <p className="catalog-search-empty">Nenhum item encontrado.</p>}
                   {items.length > 0 && (
                     <div className="results-list">
                       {items.map((item) => (
@@ -835,6 +839,7 @@ function PurchaseForm({
                       ))}
                     </div>
                   )}
+                    {selectedItem && <p className="selected-item-summary"><CheckCircle2 size={16} /> Item selecionado: <strong>{selectedItem.code}</strong></p>}
                 </div>
               ) : (
                 <div className="step-fields">
@@ -844,11 +849,14 @@ function PurchaseForm({
                   {linkBlocked && <p className="alert error">Amazon, Shopee e Mercado Livre não são permitidos.</p>}
                 </div>
               )}
-            </>
-          )}
+              </section>
 
-          {step === 2 && (
-            <div className="step-fields">
+              <section className="request-form-section">
+                <div className="request-form-section-heading">
+                  <span>2</span>
+                  <div><h3>Detalhes da compra</h3><p>Informe quanto precisa, o centro de custo e a justificativa.</p></div>
+                </div>
+                <div className="step-fields">
               <div className="two-columns">
                 <label>Quantidade<input min="1" value={form.quantity} onChange={(event) => setFormValue(setForm, 'quantity', event.target.value)} type="number" /></label>
                 <label>Centro de custo<select value={form.costCenterId} onChange={(event) => setFormValue(setForm, 'costCenterId', event.target.value)}><option value="">Selecione</option>{costCenters.map((center) => <option key={center.id} value={center.id}>{center.code} - {center.name}</option>)}</select></label>
@@ -860,10 +868,10 @@ function PurchaseForm({
                   <label>Foto do produto<input accept="image/*" onChange={(event) => setPhoto(event.target.files?.[0] ?? null)} type="file" /></label>
                 </div>
               )}
+                </div>
+              </section>
             </div>
-          )}
-
-          {step === 3 && (
+          ) : (
             <div className="review-summary">
               <dl>
                 <div><dt>Item</dt><dd>{mode === 'catalog' ? `${selectedItem?.code} · ${selectedItem?.description}` : form.newItemName}</dd></div>
@@ -871,6 +879,8 @@ function PurchaseForm({
                 <div><dt>Centro de custo</dt><dd>{selectedCostCenter ? `${selectedCostCenter.code} · ${selectedCostCenter.name}` : '-'}</dd></div>
                 <div className="full"><dt>Justificativa</dt><dd>{form.justification}</dd></div>
                 {mode === 'new' && <div className="full"><dt>Fornecedor</dt><dd>{form.supplierLink}</dd></div>}
+                {mode === 'new' && technicalFile && <div><dt>Ficha técnica</dt><dd>{technicalFile.name}</dd></div>}
+                {mode === 'new' && photo && <div><dt>Foto</dt><dd>{photo.name}</dd></div>}
               </dl>
               <p><CheckCircle2 size={17} /> A solicitação será encaminhada para análise da coordenação.</p>
             </div>
@@ -880,11 +890,13 @@ function PurchaseForm({
         </div>
 
         <footer className="wizard-actions">
-          {step > 1 && <button className="secondary-action" onClick={() => { setError(''); setStep((current) => current - 1) }} type="button"><ChevronLeft size={17} /> Voltar</button>}
-          {step < 3 ? (
-            <button className="primary-action" onClick={nextStep} type="button">Continuar <ChevronRight size={17} /></button>
+          {reviewing ? (
+            <>
+              <button className="secondary-action" disabled={submitting} onClick={() => { setError(''); setReviewing(false) }} type="button"><ChevronLeft size={17} /> Editar formulário</button>
+              <button className="primary-action" disabled={submitting} type="submit"><Send size={17} /> {submitting ? 'Enviando...' : 'Enviar solicitação'}</button>
+            </>
           ) : (
-            <button className="primary-action" type="submit"><Send size={17} /> Enviar solicitação</button>
+            <button className="primary-action" onClick={reviewRequest} type="button">Revisar solicitação <ChevronRight size={17} /></button>
           )}
         </footer>
       </form>
@@ -1003,6 +1015,7 @@ function CoordinatorDashboard({
       )
       setCatalogFile(null)
       setCatalogPreview(null)
+      setRefreshKey((value) => value + 1)
       if (catalogFileInputRef.current) catalogFileInputRef.current.value = ''
     } catch (error) {
       setImportError(error instanceof Error ? error.message : 'Erro ao importar catálogo.')
@@ -1084,14 +1097,10 @@ function CoordinatorDashboard({
             <Database size={22} />
             <div>
               <h2>Itens do catálogo</h2>
-              <p className="muted">Espaço preparado para a futura gestão dos itens importados.</p>
+              <p className="muted">Consulte os produtos atualmente disponíveis no banco.</p>
             </div>
           </div>
-          <div className="catalog-placeholder">
-            <FileSpreadsheet size={28} />
-            <strong>Catálogo centralizado</strong>
-            <p>Após a importação, os itens ficam disponíveis para consulta nas solicitações dos professores.</p>
-          </div>
+          <CatalogBrowser refreshKey={refreshKey} token={token} />
         </section>
       </div>
     )
@@ -1113,6 +1122,73 @@ function CoordinatorDashboard({
           ))}
         </div>
       </section>
+  )
+}
+
+function CatalogBrowser({ token, refreshKey }: { token: string; refreshKey: number }) {
+  const pageSize = 80
+  const [search, setSearch] = useState('')
+  const [items, setItems] = useState<CatalogItem[]>([])
+  const [loading, setLoading] = useState(false)
+  const [hasMore, setHasMore] = useState(true)
+  const [error, setError] = useState('')
+
+  const loadItems = useCallback(async (offset: number, replace: boolean) => {
+    setLoading(true)
+    setError('')
+    try {
+      const result = await api<CatalogItem[]>(
+        token,
+        `/catalog?search=${encodeURIComponent(search.trim())}&offset=${offset}&limit=${pageSize}`,
+      )
+      setItems((current) => replace ? result : [...current, ...result])
+      setHasMore(result.length === pageSize)
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : 'Não foi possível carregar o catálogo.')
+    } finally {
+      setLoading(false)
+    }
+  }, [search, token])
+
+  useEffect(() => {
+    setItems([])
+    setHasMore(true)
+    const timeout = window.setTimeout(() => loadItems(0, true), 250)
+    return () => window.clearTimeout(timeout)
+  }, [loadItems, refreshKey])
+
+  function handleScroll(event: React.UIEvent<HTMLDivElement>) {
+    const container = event.currentTarget
+    const nearEnd = container.scrollHeight - container.scrollTop - container.clientHeight < 90
+    if (nearEnd && hasMore && !loading) loadItems(items.length, false)
+  }
+
+  return (
+    <div className="catalog-browser">
+      <label className="catalog-browser-search">
+        <Search size={17} />
+        <input aria-label="Buscar no catálogo" onChange={(event) => setSearch(event.target.value)} placeholder="Buscar por código ou descrição" value={search} />
+      </label>
+
+      <div className="catalog-items-table">
+        <div className="catalog-items-head"><span>Código</span><span>Descrição</span></div>
+        <div className="catalog-items-scroll" onScroll={handleScroll} tabIndex={0}>
+          {items.map((item) => (
+            <article className="catalog-item-row" key={item.id}>
+              <strong>{item.code}</strong>
+              <span>{item.description}</span>
+            </article>
+          ))}
+          {!loading && !error && items.length === 0 && (
+            <div className="catalog-items-empty"><FileSpreadsheet size={25} /><strong>Nenhum item encontrado</strong><span>Importe um catálogo ou altere a busca.</span></div>
+          )}
+          {error && <div className="catalog-items-feedback error"><span>{error}</span><button onClick={() => loadItems(0, true)} type="button">Tentar novamente</button></div>}
+          {loading && <p className="catalog-items-loading">Carregando itens...</p>}
+          {!loading && !error && items.length > 0 && !hasMore && <p className="catalog-items-end">Fim do catálogo · {items.length} itens exibidos</p>}
+        </div>
+      </div>
+      <p className="catalog-scroll-hint">Role a lista para carregar mais produtos.</p>
+    </div>
   )
 }
 
