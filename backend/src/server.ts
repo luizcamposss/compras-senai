@@ -7,6 +7,8 @@ import ExcelJS from "exceljs";
 import { mkdirSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { extname, join } from "node:path";
+import { Readable } from "node:stream";
+import { TextDecoder } from "node:util";
 import { requireAuth, requireRole, signToken } from "./auth.js";
 import { initDatabase, query, withTransaction } from "./db.js";
 import { assertAllowedSupplierLink, assertRequiredText, parsePositiveInt } from "./validators.js";
@@ -666,11 +668,11 @@ async function parseCatalogFile(path: string, originalName: string): Promise<Cat
 
   try {
     if (extension === ".csv") {
-      const content = await readFile(path, "utf8");
+      const content = decodeCsvContent(await readFile(path));
       if (!content.trim()) throw new CatalogFileError("Arquivo vazio.");
       if (content.includes("\0")) throw new CatalogFileError("Nao foi possivel interpretar o arquivo CSV.");
       const delimiter = detectCsvDelimiter(content);
-      worksheet = await workbook.csv.readFile(path, { parserOptions: { delimiter } });
+      worksheet = await workbook.csv.read(Readable.from([content]), { parserOptions: { delimiter } });
     } else {
       await workbook.xlsx.readFile(path);
       worksheet = workbook.worksheets[0];
@@ -689,28 +691,40 @@ async function parseCatalogFile(path: string, originalName: string): Promise<Cat
   return parseCatalogWorksheet(worksheet);
 }
 
+function decodeCsvContent(content: Buffer) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch {
+    return new TextDecoder("windows-1252").decode(content);
+  }
+}
+
 function parseCatalogWorksheet(worksheet: ExcelJS.Worksheet): CatalogParseResult {
   const codeAliases = new Set(["codigo", "cod", "code", "item", "cod_item", "codigo_item"]);
   const descriptionAliases = new Set(["descricao", "description", "nome", "produto", "item_descricao"]);
   let headerRowNumber = 0;
+  let codeIndex = 0;
+  let descriptionIndex = 0;
+  let hasContent = false;
 
   for (let rowNumber = 1; rowNumber <= Math.min(worksheet.rowCount, 20); rowNumber += 1) {
     const row = worksheet.getRow(rowNumber);
-    if (rowHasContent(row)) {
+    if (!rowHasContent(row)) continue;
+    hasContent = true;
+    const normalizedHeaders = Array.from({ length: row.cellCount }, (_, index) => (
+      normalizeKey(row.getCell(index + 1).text)
+    ));
+    const foundCodeIndex = normalizedHeaders.findIndex((header) => codeAliases.has(header)) + 1;
+    const foundDescriptionIndex = normalizedHeaders.findIndex((header) => descriptionAliases.has(header)) + 1;
+    if (foundCodeIndex && foundDescriptionIndex && foundCodeIndex !== foundDescriptionIndex) {
       headerRowNumber = rowNumber;
+      codeIndex = foundCodeIndex;
+      descriptionIndex = foundDescriptionIndex;
       break;
     }
   }
-  if (!headerRowNumber) throw new CatalogFileError("Arquivo vazio.");
-
-  const headerRow = worksheet.getRow(headerRowNumber);
-  const normalizedHeaders = Array.from({ length: headerRow.cellCount }, (_, index) => (
-    normalizeKey(headerRow.getCell(index + 1).text)
-  ));
-  const codeIndex = normalizedHeaders.findIndex((header) => codeAliases.has(header)) + 1;
-  const descriptionIndex = normalizedHeaders.findIndex((header) => descriptionAliases.has(header)) + 1;
-
-  if (!codeIndex || !descriptionIndex || codeIndex === descriptionIndex) {
+  if (!headerRowNumber && !hasContent) throw new CatalogFileError("Arquivo vazio.");
+  if (!headerRowNumber) {
     throw new CatalogFileError("Nao foi possivel identificar as colunas Codigo e Descricao.");
   }
 
