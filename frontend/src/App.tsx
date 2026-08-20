@@ -27,14 +27,16 @@ import {
   TicketCheck,
   XCircle,
   User,
+  Users,
 } from 'lucide-react'
 import './App.css'
 import { ProfileView, type ProfileUser } from './ProfileView'
+import { UsersView } from './UsersView'
 
 const API_URL = import.meta.env.VITE_API_URL ?? `http://${window.location.hostname}:3333/api`
 
 type Role = 'professor' | 'coordenacao'
-type AppView = 'overview' | 'new-request' | 'requests' | 'catalog' | 'queue' | 'profile' | 'settings'
+type AppView = 'overview' | 'new-request' | 'requests' | 'catalog' | 'queue' | 'users' | 'profile' | 'settings'
 
 type User = ProfileUser
 
@@ -44,6 +46,14 @@ type CatalogItem = {
   description: string
   costCenterCode?: string
   costCenterName?: string
+}
+
+type CatalogPreview = {
+  fileName: string
+  found: number
+  valid: number
+  ignored: number
+  preview: Array<{ code: string; description: string }>
 }
 
 type CostCenter = {
@@ -134,6 +144,8 @@ function App() {
         />
       ) : activeView === 'settings' ? (
         <AccountFutureView view="settings" />
+      ) : activeView === 'users' && user.role === 'coordenacao' ? (
+        <UsersView apiUrl={API_URL} currentUserId={user.id} token={token} />
       ) : user.role === 'professor' ? (
         <ProfessorDashboard activeView={activeView} token={token} onNavigate={setActiveView} />
       ) : (
@@ -255,14 +267,30 @@ function Shell({
 }) {
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const [notificationsLoading, setNotificationsLoading] = useState(false)
+  const [notificationsError, setNotificationsError] = useState('')
+  const [notificationActionId, setNotificationActionId] = useState<number | null>(null)
+  const [markingAllNotifications, setMarkingAllNotifications] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const notificationsRef = useRef<HTMLDivElement>(null)
   const userMenuRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => {
-    api<Notification[]>(token, '/notifications').then(setNotifications).catch(() => setNotifications([]))
+  const loadNotifications = useCallback(async () => {
+    setNotificationsLoading(true)
+    setNotificationsError('')
+    try {
+      setNotifications(await api<Notification[]>(token, '/notifications'))
+    } catch {
+      setNotificationsError('Não foi possível carregar as notificações.')
+    } finally {
+      setNotificationsLoading(false)
+    }
   }, [token])
+
+  useEffect(() => {
+    void loadNotifications()
+  }, [loadNotifications])
 
   useEffect(() => {
     function closeHeaderMenus(event: MouseEvent) {
@@ -287,19 +315,43 @@ function Shell({
         { view: 'overview', label: 'Visão geral', icon: <Home size={18} /> },
         { view: 'catalog', label: 'Catálogo', icon: <FileSpreadsheet size={18} /> },
         { view: 'queue', label: 'Fila de solicitações', icon: <ClipboardList size={18} /> },
+        { view: 'users', label: 'Usuários', icon: <Users size={18} /> },
       ]
 
   async function markNotificationRead(id: number) {
-    await api(token, `/notifications/${id}/read`, { method: 'PATCH' })
-    setNotifications((current) => current.map((item) => (
-      item.id === id ? { ...item, readAt: new Date().toISOString() } : item
-    )))
+    setNotificationActionId(id)
+    setNotificationsError('')
+    try {
+      await api(token, `/notifications/${id}/read`, { method: 'PATCH' })
+      setNotifications((current) => current.map((item) => (
+        item.id === id ? { ...item, readAt: new Date().toISOString() } : item
+      )))
+      return true
+    } catch {
+      setNotificationsError('Não foi possível marcar a notificação como lida.')
+      return false
+    } finally {
+      setNotificationActionId(null)
+    }
   }
 
   async function markAllNotificationsRead() {
-    await api(token, '/notifications/read-all', { method: 'PATCH' })
-    const readAt = new Date().toISOString()
-    setNotifications((current) => current.map((item) => ({ ...item, readAt: item.readAt ?? readAt })))
+    setMarkingAllNotifications(true)
+    setNotificationsError('')
+    try {
+      await api(token, '/notifications/read-all', { method: 'PATCH' })
+      const readAt = new Date().toISOString()
+      setNotifications((current) => current.map((item) => ({ ...item, readAt: item.readAt ?? readAt })))
+    } catch {
+      setNotificationsError('Não foi possível marcar as notificações como lidas.')
+    } finally {
+      setMarkingAllNotifications(false)
+    }
+  }
+
+  async function openNotification(notification: Notification) {
+    if (!notification.readAt && !(await markNotificationRead(notification.id))) return
+    if (user.role === 'professor') navigate('requests')
   }
 
   function navigate(view: AppView) {
@@ -351,10 +403,14 @@ function Shell({
               <button
                 aria-expanded={notificationsOpen}
                 aria-haspopup="true"
+                aria-label={unread > 0 ? `Notificações: ${unread} não lidas` : 'Notificações'}
                 className={notificationsOpen ? 'notification-trigger active' : 'notification-trigger'}
                 onClick={() => {
-                  setNotificationsOpen((open) => !open)
+                  const willOpen = !notificationsOpen
+                  setNotificationsOpen(willOpen)
                   setUserMenuOpen(false)
+                  setMobileMenuOpen(false)
+                  if (willOpen) void loadNotifications()
                 }}
                 title="Notificações"
                 type="button"
@@ -364,9 +420,13 @@ function Shell({
               </button>
               {notificationsOpen && (
                 <NotificationsDropdown
+                  actionId={notificationActionId}
+                  error={notificationsError}
+                  loading={notificationsLoading}
+                  markingAll={markingAllNotifications}
                   notifications={notifications}
                   onMarkAllRead={markAllNotificationsRead}
-                  onMarkRead={markNotificationRead}
+                  onNotificationClick={openNotification}
                 />
               )}
             </div>
@@ -883,26 +943,72 @@ function CoordinatorDashboard({
 }) {
   const [requests, setRequests] = useState<PurchaseRequest[]>([])
   const [importMessage, setImportMessage] = useState('')
+  const [importError, setImportError] = useState('')
+  const [catalogFile, setCatalogFile] = useState<File | null>(null)
+  const [catalogPreview, setCatalogPreview] = useState<CatalogPreview | null>(null)
+  const [analyzingCatalog, setAnalyzingCatalog] = useState(false)
+  const [importingCatalog, setImportingCatalog] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
+  const catalogFileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     api<PurchaseRequest[]>(token, '/requests').then(setRequests)
   }, [token, refreshKey])
 
-  async function importCatalog(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const file = new FormData(event.currentTarget).get('file')
-    if (!(file instanceof File) || !file.name) return
-
+  async function analyzeCatalog(file: File) {
+    setCatalogFile(file)
+    setCatalogPreview(null)
+    setImportMessage('')
+    setImportError('')
+    setAnalyzingCatalog(true)
     const payload = new FormData()
     payload.append('file', file)
-    const result = await api<{ imported: number }>(token, '/catalog/import', {
-      method: 'POST',
-      body: payload,
-      isFormData: true,
-    })
-    setImportMessage(`${result.imported} itens importados. O catalogo anterior foi substituido.`)
-    event.currentTarget.reset()
+    try {
+      const result = await api<CatalogPreview>(token, '/catalog/import/preview', {
+        method: 'POST',
+        body: payload,
+        isFormData: true,
+      })
+      setCatalogPreview(result)
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : 'Não foi possível analisar o arquivo.')
+    } finally {
+      setAnalyzingCatalog(false)
+    }
+  }
+
+  function cancelCatalogImport() {
+    setCatalogFile(null)
+    setCatalogPreview(null)
+    setImportError('')
+    if (catalogFileInputRef.current) catalogFileInputRef.current.value = ''
+  }
+
+  async function confirmCatalogImport() {
+    if (!catalogFile || !catalogPreview) return
+    setImportingCatalog(true)
+    setImportError('')
+    setImportMessage('')
+    const payload = new FormData()
+    payload.append('file', catalogFile)
+    try {
+      const result = await api<{ message: string; imported: number; ignored: number }>(token, '/catalog/import', {
+        method: 'POST',
+        body: payload,
+        isFormData: true,
+      })
+      setImportMessage(
+        `Catálogo importado com sucesso. ${result.imported} ${result.imported === 1 ? 'item importado' : 'itens importados'}. `
+        + `${result.ignored} ${result.ignored === 1 ? 'linha ignorada' : 'linhas ignoradas'}.`,
+      )
+      setCatalogFile(null)
+      setCatalogPreview(null)
+      if (catalogFileInputRef.current) catalogFileInputRef.current.value = ''
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : 'Erro ao importar catálogo.')
+    } finally {
+      setImportingCatalog(false)
+    }
   }
 
   if (activeView === 'overview') {
@@ -920,14 +1026,58 @@ function CoordinatorDashboard({
               <p className="muted">Envie uma planilha XLSX ou CSV com código e descrição.</p>
             </div>
           </div>
-          <form className="form-stack catalog-import-form" onSubmit={importCatalog}>
-            <input accept=".xlsx,.csv" name="file" required type="file" />
+          <div className="form-stack catalog-import-form">
+            <input
+              accept=".xlsx,.csv"
+              disabled={analyzingCatalog || importingCatalog}
+              onChange={(event) => {
+                const file = event.target.files?.[0]
+                if (file) analyzeCatalog(file)
+              }}
+              ref={catalogFileInputRef}
+              type="file"
+            />
+            {analyzingCatalog && <p className="catalog-analysis-state">Analisando arquivo...</p>}
+            {importError && <p className="alert error">{importError}</p>}
             {importMessage && <p className="alert success">{importMessage}</p>}
-            <button className="primary-action" type="submit">
-              <Upload size={18} />
-              Substituir catálogo
-            </button>
-          </form>
+
+            {catalogPreview && (
+              <div className="catalog-preview">
+                <div className="catalog-preview-file">
+                  <CheckCircle2 size={20} />
+                  <div>
+                    <strong>{catalogPreview.fileName}</strong>
+                    <span>Arquivo analisado com sucesso.</span>
+                  </div>
+                </div>
+                <div className="catalog-preview-stats">
+                  <span><strong>{catalogPreview.found}</strong> {catalogPreview.found === 1 ? 'registro' : 'registros'}</span>
+                  <span><strong>{catalogPreview.valid}</strong> {catalogPreview.valid === 1 ? 'válido' : 'válidos'}</span>
+                  <span className={catalogPreview.ignored > 0 ? 'has-ignored' : ''}>
+                    <strong>{catalogPreview.ignored}</strong> {catalogPreview.ignored === 1 ? 'ignorado' : 'ignorados'}
+                  </span>
+                </div>
+                <div className="catalog-preview-table">
+                  <h3>Pré-visualização</h3>
+                  <div className="catalog-preview-head"><span>Código</span><span>Descrição</span></div>
+                  {catalogPreview.preview.map((item, index) => (
+                    <div className="catalog-preview-row" key={`${item.code}-${index}`}>
+                      <strong>{item.code}</strong><span>{item.description}</span>
+                    </div>
+                  ))}
+                </div>
+                <div className="catalog-preview-actions">
+                  <button className="secondary-action" disabled={importingCatalog} onClick={cancelCatalogImport} type="button">
+                    Cancelar
+                  </button>
+                  <button className="primary-action" disabled={importingCatalog} onClick={confirmCatalogImport} type="button">
+                    <Upload size={18} />
+                    {importingCatalog ? 'Importando...' : 'Confirmar importação'}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </section>
         <section className="workspace-section catalog-future-panel">
           <div className="section-heading">
@@ -1125,34 +1275,51 @@ function RequestList({ title, requests }: { title: string; requests: PurchaseReq
 }
 
 function NotificationsDropdown({
+  actionId,
+  error,
+  loading,
+  markingAll,
   notifications,
-  onMarkRead,
+  onNotificationClick,
   onMarkAllRead,
 }: {
+  actionId: number | null
+  error: string
+  loading: boolean
+  markingAll: boolean
   notifications: Notification[]
-  onMarkRead: (id: number) => Promise<void>
+  onNotificationClick: (notification: Notification) => Promise<void>
   onMarkAllRead: () => Promise<void>
 }) {
   const unread = notifications.filter((notification) => !notification.readAt).length
 
   return (
-    <section className="notifications-dropdown" aria-label="Notificações">
+    <section aria-busy={loading} className="notifications-dropdown" aria-label="Notificações">
       <header>
         <div>
           <strong>Notificações</strong>
-          <span>{unread > 0 ? `${unread} não lida${unread > 1 ? 's' : ''}` : 'Tudo em dia'}</span>
+          <span>{loading ? 'Atualizando...' : unread > 0 ? `${unread} não lida${unread > 1 ? 's' : ''}` : 'Tudo em dia'}</span>
         </div>
-        <button disabled={unread === 0} onClick={onMarkAllRead} type="button">
-          <CheckCheck size={16} /> Marcar todas como lidas
-        </button>
+        {unread > 0 && (
+          <button disabled={markingAll} onClick={onMarkAllRead} type="button">
+            <CheckCheck size={16} /> {markingAll ? 'Marcando...' : 'Marcar todas como lidas'}
+          </button>
+        )}
       </header>
+      {error && <p className="notifications-error">{error}</p>}
       <div className="notifications-scroll">
-        {notifications.length === 0 && <p className="notifications-empty">Nenhuma notificação por enquanto.</p>}
+        {!loading && notifications.length === 0 && !error && (
+          <div className="notifications-empty">
+            <strong>Nenhuma notificação</strong>
+            <span>Você está em dia.</span>
+          </div>
+        )}
         {notifications.map((notification) => (
           <button
             className={notification.readAt ? 'notification-row read' : 'notification-row'}
+            disabled={actionId === notification.id}
             key={notification.id}
-            onClick={() => !notification.readAt && onMarkRead(notification.id)}
+            onClick={() => onNotificationClick(notification)}
             type="button"
           >
             <span className="notification-dot" />
@@ -1175,15 +1342,28 @@ function getPageTitle(view: AppView, role: Role) {
     requests: 'Minhas solicitações',
     catalog: 'Catálogo',
     queue: 'Fila de solicitações',
+    users: 'Usuários',
     profile: 'Meu perfil',
     settings: 'Configurações',
   }
-  if (role === 'professor' && (view === 'catalog' || view === 'queue')) return 'Visão geral'
+  if (role === 'professor' && (view === 'catalog' || view === 'queue' || view === 'users')) return 'Visão geral'
   if (role === 'coordenacao' && (view === 'new-request' || view === 'requests')) return 'Visão geral'
   return titles[view]
 }
 
 function formatNotificationDate(value: string) {
+  const date = new Date(value)
+  const now = new Date()
+  const elapsed = now.getTime() - date.getTime()
+  if (elapsed >= 0 && elapsed < 60_000) return 'Agora'
+
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const notificationDay = new Date(date.getFullYear(), date.getMonth(), date.getDate())
+  const dayDifference = Math.round((today.getTime() - notificationDay.getTime()) / 86_400_000)
+  const time = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' }).format(date)
+  if (dayDifference === 0) return `Hoje, ${time}`
+  if (dayDifference === 1) return `Ontem, ${time}`
+
   return new Intl.DateTimeFormat('pt-BR', {
     day: '2-digit',
     month: 'short',

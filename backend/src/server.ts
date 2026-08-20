@@ -5,7 +5,8 @@ import bcrypt from "bcryptjs";
 import multer from "multer";
 import ExcelJS from "exceljs";
 import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { readFile, unlink } from "node:fs/promises";
+import { extname, join } from "node:path";
 import { requireAuth, requireRole, signToken } from "./auth.js";
 import { initDatabase, query, withTransaction } from "./db.js";
 import { assertAllowedSupplierLink, assertRequiredText, parsePositiveInt } from "./validators.js";
@@ -16,6 +17,24 @@ const uploadDir = join(process.cwd(), "uploads");
 mkdirSync(uploadDir, { recursive: true });
 
 const upload = multer({ dest: uploadDir });
+
+type ManagedUser = {
+  id: number;
+  name: string;
+  email: string;
+  role: "professor" | "coordenacao";
+  active: boolean;
+};
+
+type CatalogItemInput = { code: string; description: string };
+
+type CatalogParseResult = {
+  found: number;
+  ignored: number;
+  items: CatalogItemInput[];
+};
+
+class CatalogFileError extends Error {}
 
 const configuredOrigins = (process.env.CORS_ORIGINS ?? process.env.FRONTEND_URL ?? "http://localhost:5173")
   .split(",")
@@ -46,14 +65,25 @@ app.get("/api/health", (_req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   const email = String(req.body.email ?? "").trim().toLowerCase();
   const password = String(req.body.password ?? "");
-  const rows = await query<{ id: number; name: string; email: string; password_hash: string; role: "professor" | "coordenacao" }>(
-    "SELECT id, name, email, password_hash, role FROM dbo.users WHERE email = @email",
+  const rows = await query<{
+    id: number;
+    name: string;
+    email: string;
+    password_hash: string;
+    role: "professor" | "coordenacao";
+    is_active: boolean;
+  }>(
+    "SELECT id, name, email, password_hash, role, is_active FROM dbo.users WHERE email = @email",
     { email },
   );
   const user = rows[0];
 
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
     res.status(401).json({ message: "E-mail ou senha invalidos." });
+    return;
+  }
+  if (!user.is_active) {
+    res.status(403).json({ message: "Usuario desativado. Entre em contato com a coordenacao." });
     return;
   }
 
@@ -163,6 +193,127 @@ app.patch("/api/me/password", requireAuth, async (req, res) => {
   res.json({ message: "Senha alterada com sucesso." });
 });
 
+app.get("/api/users", requireAuth, requireRole("coordenacao"), async (_req, res) => {
+  const users = await query<ManagedUser>(
+    `SELECT id, name, email, role, CAST(is_active AS BIT) AS active
+     FROM dbo.users
+     ORDER BY name, id`,
+  );
+  res.json(users);
+});
+
+app.post("/api/users", requireAuth, requireRole("coordenacao"), async (req, res) => {
+  const validation = validateManagedUser(req.body, true);
+  if (!validation.ok) {
+    res.status(400).json({ message: validation.message });
+    return;
+  }
+
+  const { name, email, role, password } = validation.data;
+  const duplicated = await query<{ id: number }>("SELECT id FROM dbo.users WHERE email = @email", { email });
+  if (duplicated.length > 0) {
+    res.status(409).json({ message: "Este e-mail ja esta sendo utilizado." });
+    return;
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(password, 10);
+    const users = await query<ManagedUser>(
+      `INSERT INTO dbo.users (name, email, password_hash, role, is_active)
+       OUTPUT INSERTED.id, INSERTED.name, INSERTED.email, INSERTED.role,
+              CAST(INSERTED.is_active AS BIT) AS active
+       VALUES (@name, @email, @passwordHash, @role, 1)`,
+      { name, email, passwordHash, role },
+    );
+    res.status(201).json({ message: "Usuario criado com sucesso.", user: users[0] });
+  } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      res.status(409).json({ message: "Este e-mail ja esta sendo utilizado." });
+      return;
+    }
+    throw error;
+  }
+});
+
+app.patch("/api/users/:id", requireAuth, requireRole("coordenacao"), async (req, res) => {
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    res.status(400).json({ message: "Usuario invalido." });
+    return;
+  }
+  if (userId === Number(req.user?.id)) {
+    res.status(400).json({ message: "Edite sua propria conta pela tela Meu perfil." });
+    return;
+  }
+
+  const validation = validateManagedUser(req.body, false);
+  if (!validation.ok) {
+    res.status(400).json({ message: validation.message });
+    return;
+  }
+  const { name, email, role } = validation.data;
+  const duplicated = await query<{ id: number }>(
+    "SELECT id FROM dbo.users WHERE email = @email AND id <> @userId",
+    { email, userId },
+  );
+  if (duplicated.length > 0) {
+    res.status(409).json({ message: "Este e-mail ja esta sendo utilizado." });
+    return;
+  }
+
+  try {
+    const users = await query<ManagedUser>(
+      `UPDATE dbo.users
+       SET name = @name, email = @email, role = @role
+       OUTPUT INSERTED.id, INSERTED.name, INSERTED.email, INSERTED.role,
+              CAST(INSERTED.is_active AS BIT) AS active
+       WHERE id = @userId`,
+      { name, email, role, userId },
+    );
+    if (!users[0]) {
+      res.status(404).json({ message: "Usuario nao encontrado." });
+      return;
+    }
+    res.json({ message: "Usuario atualizado com sucesso.", user: users[0] });
+  } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      res.status(409).json({ message: "Este e-mail ja esta sendo utilizado." });
+      return;
+    }
+    throw error;
+  }
+});
+
+app.patch("/api/users/:id/status", requireAuth, requireRole("coordenacao"), async (req, res) => {
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId) || userId <= 0 || typeof req.body?.active !== "boolean") {
+    res.status(400).json({ message: "Usuario ou status invalido." });
+    return;
+  }
+  if (userId === Number(req.user?.id)) {
+    res.status(400).json({ message: "Voce nao pode alterar o status da propria conta." });
+    return;
+  }
+
+  const users = await query<ManagedUser>(
+    `UPDATE dbo.users
+     SET is_active = @active
+     OUTPUT INSERTED.id, INSERTED.name, INSERTED.email, INSERTED.role,
+            CAST(INSERTED.is_active AS BIT) AS active
+     WHERE id = @userId`,
+    { active: req.body.active, userId },
+  );
+  if (!users[0]) {
+    res.status(404).json({ message: "Usuario nao encontrado." });
+    return;
+  }
+
+  res.json({
+    message: req.body.active ? "Usuario ativado com sucesso." : "Usuario desativado com sucesso.",
+    user: users[0],
+  });
+});
+
 app.get("/api/cost-centers", requireAuth, async (_req, res) => {
   const rows = await query("SELECT id, code, name FROM dbo.cost_centers ORDER BY code");
   res.json(rows);
@@ -183,28 +334,42 @@ app.get("/api/catalog", requireAuth, async (req, res) => {
   res.json(rows);
 });
 
+app.post("/api/catalog/import/preview", requireAuth, requireRole("coordenacao"), upload.single("file"), async (req, res) => {
+  if (!req.file) {
+    res.status(400).json({ message: "Envie uma planilha XLSX ou CSV." });
+    return;
+  }
+
+  try {
+    const parsed = await parseCatalogFile(req.file.path, req.file.originalname);
+    res.json({
+      fileName: req.file.originalname,
+      found: parsed.found,
+      valid: parsed.items.length,
+      ignored: parsed.ignored,
+      preview: parsed.items.slice(0, 8),
+    });
+  } catch (error) {
+    res.status(400).json({
+      message: error instanceof CatalogFileError ? error.message : "Nao foi possivel interpretar o arquivo.",
+    });
+  } finally {
+    await removeTemporaryFile(req.file.path);
+  }
+});
+
 app.post("/api/catalog/import", requireAuth, requireRole("coordenacao"), upload.single("file"), async (req, res) => {
   if (!req.file) {
     res.status(400).json({ message: "Envie uma planilha XLSX ou CSV." });
     return;
   }
 
-  const rows = await readSpreadsheetRows(req.file.path, req.file.originalname);
-
-  const items = rows
-    .map((row) => normalizeCatalogRow(row))
-    .filter((item): item is { code: string; description: string } => Boolean(item));
-
-  if (items.length === 0) {
-    res.status(400).json({ message: "Nenhum item com codigo e descricao foi encontrado." });
-    return;
-  }
-
   try {
+    const parsed = await parseCatalogFile(req.file.path, req.file.originalname);
     await withTransaction(async (transaction) => {
       await query("UPDATE dbo.purchase_requests SET catalog_item_id = NULL WHERE catalog_item_id IS NOT NULL", {}, transaction);
       await query("DELETE FROM dbo.catalog_items", {}, transaction);
-      for (const item of items) {
+      for (const item of parsed.items) {
         await query(
           "INSERT INTO dbo.catalog_items (code, description, source) VALUES (@code, @description, N'planilha')",
           item,
@@ -212,9 +377,16 @@ app.post("/api/catalog/import", requireAuth, requireRole("coordenacao"), upload.
         );
       }
     });
-    res.json({ imported: items.length });
+    res.json({ message: "Catalogo importado com sucesso.", imported: parsed.items.length, ignored: parsed.ignored });
   } catch (error) {
-    throw error;
+    if (error instanceof CatalogFileError) {
+      res.status(400).json({ message: error.message });
+      return;
+    }
+    console.error(error);
+    res.status(500).json({ message: "Erro ao importar catalogo." });
+  } finally {
+    await removeTemporaryFile(req.file.path);
   }
 });
 
@@ -411,6 +583,34 @@ function isValidEmail(email: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
+function validateManagedUser(body: unknown, requirePassword: boolean):
+  | { ok: true; data: { name: string; email: string; role: ManagedUser["role"]; password: string } }
+  | { ok: false; message: string } {
+  const fields = body && typeof body === "object" ? body as Record<string, unknown> : {};
+  const name = String(fields.name ?? "").trim();
+  const email = String(fields.email ?? "").trim().toLowerCase();
+  const role = String(fields.role ?? "");
+  const password = String(fields.password ?? "");
+
+  if (!name || !email || (requirePassword && !password)) {
+    return { ok: false, message: "Preencha os campos obrigatorios." };
+  }
+  if (name.length > 120) {
+    return { ok: false, message: "O nome deve ter no maximo 120 caracteres." };
+  }
+  if (email.length > 160 || !isValidEmail(email)) {
+    return { ok: false, message: "Informe um e-mail valido." };
+  }
+  if (role !== "professor" && role !== "coordenacao") {
+    return { ok: false, message: "Perfil invalido." };
+  }
+  if (requirePassword && password.length < 8) {
+    return { ok: false, message: "A senha deve ter no minimo 8 caracteres." };
+  }
+
+  return { ok: true, data: { name, email, role, password } };
+}
+
 function isUniqueConstraintError(error: unknown) {
   if (!error || typeof error !== "object") return false;
 
@@ -419,28 +619,14 @@ function isUniqueConstraintError(error: unknown) {
   return number === 2601 || number === 2627;
 }
 
-function normalizeCatalogRow(row: Record<string, unknown>) {
-  const entries = Object.entries(row).reduce<Record<string, string>>((acc, [key, value]) => {
-    acc[normalizeKey(key)] = String(value ?? "").trim();
-    return acc;
-  }, {});
-
-  const code = entries.codigo || entries.cod || entries.code || entries.item || "";
-  const description = entries.descricao || entries.description || entries.descrio || entries.nome || "";
-
-  if (!code || !description) {
-    return null;
-  }
-
-  return { code, description };
-}
-
 function normalizeKey(key: string) {
   return key
+    .trim()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
 }
 
 function isAllowedDevOrigin(origin: string) {
@@ -469,37 +655,140 @@ async function saveAttachment(requestId: number, file: Express.Multer.File | und
   );
 }
 
-async function readSpreadsheetRows(path: string, originalName: string) {
-  const workbook = new ExcelJS.Workbook();
-  if (originalName.toLowerCase().endsWith(".csv")) {
-    const worksheet = await workbook.csv.readFile(path);
-    return worksheetToObjects(worksheet);
+async function parseCatalogFile(path: string, originalName: string): Promise<CatalogParseResult> {
+  const extension = extname(originalName).toLowerCase();
+  if (extension !== ".csv" && extension !== ".xlsx") {
+    throw new CatalogFileError("Formato nao suportado. Envie um arquivo XLSX ou CSV.");
   }
 
-  await workbook.xlsx.readFile(path);
-  const worksheet = workbook.worksheets[0];
-  if (!worksheet) return [];
-  return worksheetToObjects(worksheet);
+  const workbook = new ExcelJS.Workbook();
+  let worksheet: ExcelJS.Worksheet | undefined;
+
+  try {
+    if (extension === ".csv") {
+      const content = await readFile(path, "utf8");
+      if (!content.trim()) throw new CatalogFileError("Arquivo vazio.");
+      if (content.includes("\0")) throw new CatalogFileError("Nao foi possivel interpretar o arquivo CSV.");
+      const delimiter = detectCsvDelimiter(content);
+      worksheet = await workbook.csv.readFile(path, { parserOptions: { delimiter } });
+    } else {
+      await workbook.xlsx.readFile(path);
+      worksheet = workbook.worksheets[0];
+    }
+  } catch (error) {
+    if (error instanceof CatalogFileError) throw error;
+    throw new CatalogFileError(
+      extension === ".csv" ? "Nao foi possivel interpretar o arquivo CSV." : "Nao foi possivel interpretar o arquivo XLSX.",
+    );
+  }
+
+  if (!worksheet || worksheet.actualRowCount === 0) {
+    throw new CatalogFileError("Arquivo vazio.");
+  }
+
+  return parseCatalogWorksheet(worksheet);
 }
 
-function worksheetToObjects(worksheet: ExcelJS.Worksheet) {
-  const headerRow = worksheet.getRow(1);
-  const headers = headerRow.values as Array<string | number | undefined>;
-  const normalizedHeaders = headers.map((value) => normalizeKey(String(value ?? "")));
-  const rows: Record<string, unknown>[] = [];
+function parseCatalogWorksheet(worksheet: ExcelJS.Worksheet): CatalogParseResult {
+  const codeAliases = new Set(["codigo", "cod", "code", "item", "cod_item", "codigo_item"]);
+  const descriptionAliases = new Set(["descricao", "description", "nome", "produto", "item_descricao"]);
+  let headerRowNumber = 0;
 
-  worksheet.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return;
-    const values = row.values as Array<string | number | undefined>;
-    const item: Record<string, unknown> = {};
-    normalizedHeaders.forEach((header, index) => {
-      if (!header) return;
-      item[header] = values[index] ?? "";
-    });
-    rows.push(item);
-  });
+  for (let rowNumber = 1; rowNumber <= Math.min(worksheet.rowCount, 20); rowNumber += 1) {
+    const row = worksheet.getRow(rowNumber);
+    if (rowHasContent(row)) {
+      headerRowNumber = rowNumber;
+      break;
+    }
+  }
+  if (!headerRowNumber) throw new CatalogFileError("Arquivo vazio.");
 
-  return rows;
+  const headerRow = worksheet.getRow(headerRowNumber);
+  const normalizedHeaders = Array.from({ length: headerRow.cellCount }, (_, index) => (
+    normalizeKey(headerRow.getCell(index + 1).text)
+  ));
+  const codeIndex = normalizedHeaders.findIndex((header) => codeAliases.has(header)) + 1;
+  const descriptionIndex = normalizedHeaders.findIndex((header) => descriptionAliases.has(header)) + 1;
+
+  if (!codeIndex || !descriptionIndex || codeIndex === descriptionIndex) {
+    throw new CatalogFileError("Nao foi possivel identificar as colunas Codigo e Descricao.");
+  }
+
+  const items: CatalogItemInput[] = [];
+  let found = 0;
+  let ignored = 0;
+
+  for (let rowNumber = headerRowNumber + 1; rowNumber <= worksheet.rowCount; rowNumber += 1) {
+    const row = worksheet.getRow(rowNumber);
+    if (!rowHasContent(row)) continue;
+    found += 1;
+
+    const code = row.getCell(codeIndex).text.trim();
+    const description = row.getCell(descriptionIndex).text.trim();
+    if (!code || !description) {
+      ignored += 1;
+      continue;
+    }
+    items.push({ code, description });
+  }
+
+  if (items.length === 0) {
+    throw new CatalogFileError("Nenhum registro valido encontrado.");
+  }
+
+  return { found, ignored, items };
+}
+
+function rowHasContent(row: ExcelJS.Row) {
+  for (let column = 1; column <= row.cellCount; column += 1) {
+    if (row.getCell(column).text.trim()) return true;
+  }
+  return false;
+}
+
+function detectCsvDelimiter(content: string) {
+  const lines = content.replace(/^\uFEFF/, "").split(/\r?\n/).filter((line) => line.trim()).slice(0, 10);
+  if (lines.length === 0) throw new CatalogFileError("Arquivo vazio.");
+
+  const candidates = [",", ";", "\t"].map((delimiter) => {
+    const counts = lines.map((line) => countDelimiterOutsideQuotes(line, delimiter));
+    const headerCount = counts[0];
+    const matching = counts.filter((count) => count === headerCount).length;
+    return { delimiter, headerCount, consistency: matching / counts.length };
+  }).filter((candidate) => candidate.headerCount > 0)
+    .sort((first, second) => second.consistency - first.consistency || second.headerCount - first.headerCount);
+
+  const best = candidates[0];
+  const second = candidates[1];
+  if (!best || best.consistency < 0.6) {
+    throw new CatalogFileError("Nao foi possivel identificar com seguranca o separador do arquivo CSV.");
+  }
+  if (second && second.consistency === best.consistency && second.headerCount === best.headerCount) {
+    throw new CatalogFileError("Nao foi possivel identificar com seguranca o separador do arquivo CSV.");
+  }
+  return best.delimiter;
+}
+
+function countDelimiterOutsideQuotes(line: string, delimiter: string) {
+  let count = 0;
+  let quoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (character === '"') {
+      if (quoted && line[index + 1] === '"') {
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (!quoted && character === delimiter) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+async function removeTemporaryFile(path: string) {
+  await unlink(path).catch(() => undefined);
 }
 
 initDatabase()

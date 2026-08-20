@@ -99,8 +99,15 @@ export async function initDatabase() {
         email NVARCHAR(160) NOT NULL CONSTRAINT UQ_users_email UNIQUE,
         password_hash NVARCHAR(255) NOT NULL,
         role VARCHAR(20) NOT NULL CONSTRAINT CK_users_role CHECK (role IN ('professor', 'coordenacao')),
+        is_active BIT NOT NULL CONSTRAINT DF_users_is_active DEFAULT (1),
         created_at DATETIME2 NOT NULL CONSTRAINT DF_users_created_at DEFAULT SYSDATETIME()
       );
+    END;
+
+    IF COL_LENGTH(N'dbo.users', N'is_active') IS NULL
+    BEGIN
+      ALTER TABLE dbo.users
+      ADD is_active BIT NOT NULL CONSTRAINT DF_users_is_active DEFAULT (1) WITH VALUES;
     END;
 
     IF OBJECT_ID(N'dbo.cost_centers', N'U') IS NULL
