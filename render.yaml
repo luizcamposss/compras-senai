@@ -4,7 +4,7 @@ services:
     runtime: node
     plan: free
     rootDir: backend
-    buildCommand: npm install && npm run build
+    buildCommand: npm install --include=dev && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
     envVars:
@@ -19,13 +19,15 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: FRONTEND_URL
-        value: https://compras-senai.onrender.com
+        value: https://compras-senai-1.onrender.com
+      - key: CORS_ORIGINS
+        value: https://*.onrender.com,https://compras-senai-1.onrender.com,https://compras-senai.onrender.com
 
   - type: web
     name: compras-senai
     runtime: static
     rootDir: frontend
-    buildCommand: npm install && npm run build
+    buildCommand: npm install --include=dev && npm run build
     staticPublishPath: dist
     envVars:
       - key: VITE_API_URL

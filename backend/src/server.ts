@@ -44,7 +44,7 @@ const configuredOrigins = (process.env.CORS_ORIGINS ?? process.env.FRONTEND_URL 
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || isAllowedDevOrigin(origin) || configuredOrigins.includes(origin)) {
+      if (!origin || isAllowedDevOrigin(origin) || isAllowedConfiguredOrigin(origin)) {
         callback(null, true);
         return;
       }
@@ -645,6 +645,18 @@ function isAllowedDevOrigin(origin: string) {
   } catch {
     return false;
   }
+}
+
+function isAllowedConfiguredOrigin(origin: string) {
+  return configuredOrigins.some((allowedOrigin) => {
+    if (allowedOrigin === origin) return true;
+    if (!allowedOrigin.includes("*")) return false;
+
+    const pattern = allowedOrigin
+      .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+      .replaceAll("\\*", ".*");
+    return new RegExp(`^${pattern}$`).test(origin);
+  });
 }
 
 async function saveAttachment(requestId: number, file: Express.Multer.File | undefined, kind: "ficha_tecnica" | "foto") {
