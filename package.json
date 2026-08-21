@@ -1,7 +1,7 @@
 {
   "name": "compras-senai",
   "version": "1.0.0",
-  "description": "Sistema de compras SENAI com React, Node.js e SQL Server.",
+  "description": "Sistema de compras SENAI com React, Node.js e PostgreSQL.",
   "main": "index.js",
   "scripts": {
     "dev": "concurrently \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",

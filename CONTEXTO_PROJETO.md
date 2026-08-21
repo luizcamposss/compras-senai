@@ -7,7 +7,7 @@ O Compras SENAI é um MVP web para centralizar solicitações de compra de mater
 - professor: consulta o catálogo, solicita itens existentes ou sugere itens novos e acompanha os retornos;
 - coordenação: importa o catálogo institucional, consulta a fila e aprova, recusa ou solicita ajustes.
 
-O sistema roda localmente neste computador. O navegador acessa um frontend React, que chama uma API Node.js. A API persiste os dados no SQL Server Express instalado no Windows.
+O sistema roda localmente e tambem esta preparado para deploy no Render. O navegador acessa um frontend React, que chama uma API Node.js. A API persiste os dados em PostgreSQL.
 
 ```text
 Navegador
@@ -17,24 +17,21 @@ Frontend React/Vite :5173
    │ /api
    ▼
 Backend Express :3333 ───── uploads locais
-   │ ODBC + autenticação do Windows
+   │ pg + DATABASE_URL
    ▼
-SQL Server localhost\SQLEXPRESS
+PostgreSQL / Render Postgres
    └── banco compras_senai
 ```
 
 ## 2. Estado atual
 
-O projeto está funcional como MVP. A configuração antiga de Docker/MySQL foi removida e o backend foi migrado para SQL Server.
+O projeto esta funcional como MVP. A configuracao antiga de SQL Server foi substituida por PostgreSQL para permitir deploy no Render com Render Postgres.
 
-Configuração validada neste computador:
+Configuração esperada:
 
-- servidor: `localhost`;
-- instância: `SQLEXPRESS`;
-- nome completo detectado: `UO624LBM4092804\SQLEXPRESS`;
 - banco: `compras_senai`;
-- autenticação: integrada do Windows;
-- driver: `ODBC Driver 17 for SQL Server`;
+- conexao: `DATABASE_URL` ou variaveis `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`;
+- deploy: `render.yaml` com API, frontend estatico e Postgres;
 - frontend: `http://localhost:5173`;
 - backend: `http://localhost:3333`.
 
@@ -60,13 +57,13 @@ A compilação do frontend e do backend, a inicialização do banco, o login do 
 - bcrypt para hash de senhas;
 - Multer para uploads;
 - ExcelJS para arquivos XLSX e CSV;
-- `mssql` + `msnodesqlv8` para SQL Server com autenticação do Windows.
+- `pg` para PostgreSQL.
 
 ### Banco e infraestrutura
 
-- SQL Server Express local;
+- PostgreSQL local ou Render Postgres;
 - criação automática do banco e das tabelas;
-- sem Docker;
+- deploy no Render por Blueprint (`render.yaml`);
 - arquivos anexados armazenados em `backend/uploads`;
 - frontend e backend iniciados juntos pelo pacote `concurrently`.
 
@@ -301,19 +298,15 @@ Valores padrão do backend:
 
 ```dotenv
 PORT=3333
-JWT_SECRET=change-this-secret
-DB_SERVER=localhost
-DB_INSTANCE=SQLEXPRESS
-DB_NAME=compras_senai
-DB_TRUSTED_CONNECTION=true
-DB_DRIVER=ODBC Driver 17 for SQL Server
-DB_ENCRYPT=false
-DB_TRUST_SERVER_CERTIFICATE=true
+NODE_ENV=development
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/compras_senai
+DB_SSL=false
+JWT_SECRET=troque-este-segredo-em-producao
 FRONTEND_URL=http://localhost:5173
 CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 ```
 
-O arquivo `backend/.env` é opcional neste computador porque os padrões já correspondem ao ambiente local. Em produção, `JWT_SECRET` deve obrigatoriamente ser substituído por um segredo forte.
+O arquivo `backend/.env` e opcional se o PostgreSQL local estiver nos padroes do codigo. Em producao, `JWT_SECRET` deve obrigatoriamente ser substituido por um segredo forte. No Render, o Blueprint gera esse segredo automaticamente.
 
 O frontend usa `VITE_API_URL` quando definido. Sem essa variável, monta automaticamente `http://<hostname-do-navegador>:3333/api`.
 
@@ -348,13 +341,13 @@ npm run lint --prefix frontend
 npm start
 ```
 
-`npm start` inicia apenas o backend já compilado. O frontend compilado não é servido pelo Express; para uma implantação real ainda é necessário servir `frontend/dist` com um servidor web ou adaptar o backend.
+`npm start` inicia apenas o backend ja compilado. No Render, o frontend e servido como Static Site separado, conforme `render.yaml`.
 
 ## 13. Decisões de implementação
 
 - SQL parametrizado é usado nas operações com dados para evitar injeção de SQL.
 - Importação de catálogo e revisão de solicitação usam transações.
-- Papéis e estados são limitados por `CHECK constraints` no SQL Server.
+- Papeis e estados sao limitados por `CHECK constraints` no PostgreSQL.
 - Exclusão de uma solicitação apagaria seus anexos no banco por `ON DELETE CASCADE`, embora atualmente não exista rota de exclusão.
 - O frontend é uma SPA sem biblioteca de rotas; a navegação ocorre por estado interno (`activeView`).
 - A maior parte da interface está concentrada em `frontend/src/App.tsx`.
@@ -404,12 +397,12 @@ Ordem sugerida para transformar o MVP em uma aplicação institucional:
 6. adicionar filtros e paginação à fila da coordenação;
 7. separar frontend em páginas/componentes e backend em rotas/serviços/repositórios;
 8. adicionar logs de auditoria e histórico de mudanças de status;
-9. definir estratégia de backup do SQL Server e dos arquivos de upload;
-10. preparar implantação, HTTPS e serviço permanente para frontend/backend.
+9. definir estrategia de backup do PostgreSQL e dos arquivos de upload;
+10. acompanhar o deploy no Render e ajustar URLs publicas caso os slugs mudem.
 
 ## 16. Critérios básicos de aceite do MVP
 
-- SQL Server Express está ativo e acessível pelo usuário do Windows.
+- PostgreSQL esta ativo e acessivel pela `DATABASE_URL`.
 - `GET /api/health` responde `{ "ok": true }`.
 - As duas contas de demonstração conseguem entrar.
 - Professor consegue consultar catálogo e enviar os dois tipos de solicitação.
