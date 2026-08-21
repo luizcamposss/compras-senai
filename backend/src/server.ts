@@ -46,7 +46,7 @@ const configuredOrigins = (process.env.CORS_ORIGINS ?? process.env.FRONTEND_URL 
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || isAllowedDevOrigin(origin) || configuredOrigins.includes(origin)) {
+      if (!origin || isAllowedDevOrigin(origin) || isAllowedConfiguredOrigin(origin)) {
         callback(null, true);
         return;
       }
@@ -75,7 +75,7 @@ app.post("/api/auth/login", async (req, res) => {
     role: "professor" | "coordenacao";
     is_active: boolean;
   }>(
-    "SELECT id, name, email, password_hash, role, is_active FROM dbo.users WHERE email = @email",
+    "SELECT id, name, email, password_hash, role, is_active FROM users WHERE email = @email",
     { email },
   );
   const user = rows[0];
@@ -95,7 +95,7 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   const rows = await query<{ id: number; name: string; email: string; role: "professor" | "coordenacao" }>(
-    "SELECT id, name, email, role FROM dbo.users WHERE id = @userId",
+    "SELECT id, name, email, role FROM users WHERE id = @userId",
     { userId: req.user?.id },
   );
   const user = rows[0];
@@ -126,7 +126,7 @@ app.patch("/api/me", requireAuth, async (req, res) => {
   }
 
   const duplicated = await query<{ id: number }>(
-    "SELECT id FROM dbo.users WHERE email = @email AND id <> @userId",
+    "SELECT id FROM users WHERE email = @email AND id <> @userId",
     { email, userId: req.user?.id },
   );
   if (duplicated.length > 0) {
@@ -136,10 +136,10 @@ app.patch("/api/me", requireAuth, async (req, res) => {
 
   try {
     const rows = await query<{ id: number; name: string; email: string; role: "professor" | "coordenacao" }>(
-      `UPDATE dbo.users
+      `UPDATE users
        SET name = @name, email = @email
-       OUTPUT INSERTED.id, INSERTED.name, INSERTED.email, INSERTED.role
-       WHERE id = @userId`,
+       WHERE id = @userId
+       RETURNING id, name, email, role`,
       { name, email, userId: req.user?.id },
     );
     const user = rows[0];
@@ -173,7 +173,7 @@ app.patch("/api/me/password", requireAuth, async (req, res) => {
   }
 
   const rows = await query<{ password_hash: string }>(
-    "SELECT password_hash FROM dbo.users WHERE id = @userId",
+    "SELECT password_hash FROM users WHERE id = @userId",
     { userId: req.user?.id },
   );
   const user = rows[0];
@@ -189,7 +189,7 @@ app.patch("/api/me/password", requireAuth, async (req, res) => {
 
   const passwordHash = await bcrypt.hash(newPassword, 10);
   await query(
-    "UPDATE dbo.users SET password_hash = @passwordHash WHERE id = @userId",
+    "UPDATE users SET password_hash = @passwordHash WHERE id = @userId",
     { passwordHash, userId: req.user?.id },
   );
   res.json({ message: "Senha alterada com sucesso." });
@@ -197,8 +197,8 @@ app.patch("/api/me/password", requireAuth, async (req, res) => {
 
 app.get("/api/users", requireAuth, requireRole("coordenacao"), async (_req, res) => {
   const users = await query<ManagedUser>(
-    `SELECT id, name, email, role, CAST(is_active AS BIT) AS active
-     FROM dbo.users
+    `SELECT id, name, email, role, is_active AS active
+     FROM users
      ORDER BY name, id`,
   );
   res.json(users);
@@ -212,7 +212,7 @@ app.post("/api/users", requireAuth, requireRole("coordenacao"), async (req, res)
   }
 
   const { name, email, role, password } = validation.data;
-  const duplicated = await query<{ id: number }>("SELECT id FROM dbo.users WHERE email = @email", { email });
+  const duplicated = await query<{ id: number }>("SELECT id FROM users WHERE email = @email", { email });
   if (duplicated.length > 0) {
     res.status(409).json({ message: "Este e-mail ja esta sendo utilizado." });
     return;
@@ -221,10 +221,9 @@ app.post("/api/users", requireAuth, requireRole("coordenacao"), async (req, res)
   try {
     const passwordHash = await bcrypt.hash(password, 10);
     const users = await query<ManagedUser>(
-      `INSERT INTO dbo.users (name, email, password_hash, role, is_active)
-       OUTPUT INSERTED.id, INSERTED.name, INSERTED.email, INSERTED.role,
-              CAST(INSERTED.is_active AS BIT) AS active
-       VALUES (@name, @email, @passwordHash, @role, 1)`,
+      `INSERT INTO users (name, email, password_hash, role, is_active)
+       VALUES (@name, @email, @passwordHash, @role, TRUE)
+       RETURNING id, name, email, role, is_active AS active`,
       { name, email, passwordHash, role },
     );
     res.status(201).json({ message: "Usuario criado com sucesso.", user: users[0] });
@@ -255,7 +254,7 @@ app.patch("/api/users/:id", requireAuth, requireRole("coordenacao"), async (req,
   }
   const { name, email, role } = validation.data;
   const duplicated = await query<{ id: number }>(
-    "SELECT id FROM dbo.users WHERE email = @email AND id <> @userId",
+    "SELECT id FROM users WHERE email = @email AND id <> @userId",
     { email, userId },
   );
   if (duplicated.length > 0) {
@@ -265,11 +264,10 @@ app.patch("/api/users/:id", requireAuth, requireRole("coordenacao"), async (req,
 
   try {
     const users = await query<ManagedUser>(
-      `UPDATE dbo.users
+      `UPDATE users
        SET name = @name, email = @email, role = @role
-       OUTPUT INSERTED.id, INSERTED.name, INSERTED.email, INSERTED.role,
-              CAST(INSERTED.is_active AS BIT) AS active
-       WHERE id = @userId`,
+       WHERE id = @userId
+       RETURNING id, name, email, role, is_active AS active`,
       { name, email, role, userId },
     );
     if (!users[0]) {
@@ -298,11 +296,10 @@ app.patch("/api/users/:id/status", requireAuth, requireRole("coordenacao"), asyn
   }
 
   const users = await query<ManagedUser>(
-    `UPDATE dbo.users
+    `UPDATE users
      SET is_active = @active
-     OUTPUT INSERTED.id, INSERTED.name, INSERTED.email, INSERTED.role,
-            CAST(INSERTED.is_active AS BIT) AS active
-     WHERE id = @userId`,
+     WHERE id = @userId
+     RETURNING id, name, email, role, is_active AS active`,
     { active: req.body.active, userId },
   );
   if (!users[0]) {
@@ -317,7 +314,7 @@ app.patch("/api/users/:id/status", requireAuth, requireRole("coordenacao"), asyn
 });
 
 app.get("/api/cost-centers", requireAuth, async (_req, res) => {
-  const rows = await query("SELECT id, code, name FROM dbo.cost_centers ORDER BY code");
+  const rows = await query("SELECT id, code, name FROM cost_centers ORDER BY code");
   res.json(rows);
 });
 
@@ -330,13 +327,14 @@ app.get("/api/catalog", requireAuth, async (req, res) => {
   const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 200) : 40;
   const offset = Number.isInteger(requestedOffset) ? Math.max(requestedOffset, 0) : 0;
   const rows = await query(
-    `SELECT ${paginated ? "" : "TOP (40)"} ci.id, ci.code, ci.description, ci.source,
-            cc.code AS costCenterCode, cc.name AS costCenterName
-     FROM dbo.catalog_items ci
-     LEFT JOIN dbo.cost_centers cc ON cc.id = ci.cost_center_id
-     WHERE @search = N'' OR ci.code LIKE @like OR ci.description LIKE @like
+    `SELECT ci.id, ci.code, ci.description, ci.source,
+            cc.code AS "costCenterCode", cc.name AS "costCenterName"
+     FROM catalog_items ci
+     LEFT JOIN cost_centers cc ON cc.id = ci.cost_center_id
+     WHERE @search = '' OR ci.code ILIKE @like OR ci.description ILIKE @like
      ORDER BY ci.description, ci.id
-     ${paginated ? "OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY" : ""}`,
+     LIMIT @limit
+     ${paginated ? "OFFSET @offset" : ""}`,
     { search, like, offset, limit },
   );
   res.json(rows);
@@ -375,12 +373,12 @@ app.post("/api/catalog/import", requireAuth, requireRole("coordenacao"), upload.
   try {
     const parsed = await parseCatalogFile(req.file.path, req.file.originalname);
     await withTransaction(async (transaction) => {
-      await query("UPDATE dbo.purchase_request_items SET catalog_item_id = NULL WHERE catalog_item_id IS NOT NULL", {}, transaction);
-      await query("UPDATE dbo.purchase_requests SET catalog_item_id = NULL WHERE catalog_item_id IS NOT NULL", {}, transaction);
-      await query("DELETE FROM dbo.catalog_items", {}, transaction);
+      await query("UPDATE purchase_request_items SET catalog_item_id = NULL WHERE catalog_item_id IS NOT NULL", {}, transaction);
+      await query("UPDATE purchase_requests SET catalog_item_id = NULL WHERE catalog_item_id IS NOT NULL", {}, transaction);
+      await query("DELETE FROM catalog_items", {}, transaction);
       for (const item of parsed.items) {
         await query(
-          "INSERT INTO dbo.catalog_items (code, description, source) VALUES (@code, @description, N'planilha')",
+          "INSERT INTO catalog_items (code, description, source) VALUES (@code, @description, 'planilha')",
           item,
           transaction,
         );
@@ -403,12 +401,12 @@ app.get("/api/requests", requireAuth, async (req, res) => {
   const filter = req.user?.role === "professor" ? "WHERE pr.professor_id = @professorId" : "";
   const params = req.user?.role === "professor" ? { professorId: req.user.id } : {};
   const rows = await query<Record<string, unknown> & { id: number }>(
-    `SELECT pr.*, u.name as professorName, ci.code as catalogCode, ci.description as catalogDescription,
-            cc.code as costCenterCode, cc.name as costCenterName
-     FROM dbo.purchase_requests pr
-     JOIN dbo.users u ON u.id = pr.professor_id
-     LEFT JOIN dbo.catalog_items ci ON ci.id = pr.catalog_item_id
-     JOIN dbo.cost_centers cc ON cc.id = pr.cost_center_id
+    `SELECT pr.*, u.name AS "professorName", ci.code AS "catalogCode", ci.description AS "catalogDescription",
+            cc.code AS "costCenterCode", cc.name AS "costCenterName"
+     FROM purchase_requests pr
+     JOIN users u ON u.id = pr.professor_id
+     LEFT JOIN catalog_items ci ON ci.id = pr.catalog_item_id
+     JOIN cost_centers cc ON cc.id = pr.cost_center_id
      ${filter}
      ORDER BY pr.created_at DESC`,
     params,
@@ -425,13 +423,13 @@ app.get("/api/requests", requireAuth, async (req, res) => {
     new_item_description: string | null;
     supplier_link: string | null;
   }>(
-    `SELECT pri.id, pri.request_id AS requestId, pri.item_type, pri.quantity,
-            pri.catalog_item_id AS catalogItemId, ci.code AS catalogCode,
-            ci.description AS catalogDescription, pri.new_item_name,
+    `SELECT pri.id, pri.request_id AS "requestId", pri.item_type, pri.quantity,
+            pri.catalog_item_id AS "catalogItemId", ci.code AS "catalogCode",
+            ci.description AS "catalogDescription", pri.new_item_name,
             pri.new_item_description, pri.supplier_link
-     FROM dbo.purchase_request_items pri
-     JOIN dbo.purchase_requests pr ON pr.id = pri.request_id
-     LEFT JOIN dbo.catalog_items ci ON ci.id = pri.catalog_item_id
+     FROM purchase_request_items pri
+     JOIN purchase_requests pr ON pr.id = pri.request_id
+     LEFT JOIN catalog_items ci ON ci.id = pri.catalog_item_id
      ${filter}
      ORDER BY pri.id`,
     params,
@@ -489,10 +487,10 @@ app.post(
 
       const requestId = await withTransaction(async (transaction) => {
         const result = await query<{ id: number }>(
-          `INSERT INTO dbo.purchase_requests
+          `INSERT INTO purchase_requests
            (professor_id, catalog_item_id, cost_center_id, item_type, quantity, justification, status)
-           OUTPUT INSERTED.id
-           VALUES (@professorId, @catalogItemId, @costCenterId, 'catalogo', @quantity, @justification, 'aguardando_coordenacao')`,
+           VALUES (@professorId, @catalogItemId, @costCenterId, 'catalogo', @quantity, @justification, 'aguardando_coordenacao')
+           RETURNING id`,
           {
             professorId: req.user?.id,
             catalogItemId: firstItem.catalogItemId,
@@ -504,7 +502,7 @@ app.post(
         );
         for (const item of items) {
           await query(
-            `INSERT INTO dbo.purchase_request_items
+            `INSERT INTO purchase_request_items
              (request_id, catalog_item_id, item_type, quantity)
              VALUES (@requestId, @catalogItemId, 'catalogo', @quantity)`,
             { requestId: result[0].id, ...item },
@@ -542,18 +540,18 @@ app.post(
       const supplierLink = assertAllowedSupplierLink(req.body.supplierLink);
 
       const result = await query<{ id: number }>(
-        `INSERT INTO dbo.purchase_requests
+        `INSERT INTO purchase_requests
          (professor_id, cost_center_id, item_type, quantity, justification, new_item_name,
           new_item_description, supplier_link, status)
-         OUTPUT INSERTED.id
          VALUES (@professorId, @costCenterId, 'novo', @quantity, @justification,
-                 @newItemName, @newItemDescription, @supplierLink, 'novo_item_pendente')`,
+                 @newItemName, @newItemDescription, @supplierLink, 'novo_item_pendente')
+         RETURNING id`,
         { professorId: req.user?.id, costCenterId, quantity, justification, newItemName, newItemDescription, supplierLink },
       );
 
       const requestId = result[0].id;
       await query(
-        `INSERT INTO dbo.purchase_request_items
+        `INSERT INTO purchase_request_items
          (request_id, item_type, quantity, new_item_name, new_item_description, supplier_link)
          VALUES (@requestId, 'novo', @quantity, @newItemName, @newItemDescription, @supplierLink)`,
         { requestId, quantity, newItemName, newItemDescription, supplierLink },
@@ -591,7 +589,7 @@ app.patch("/api/requests/:id/review", requireAuth, requireRole("coordenacao"), a
       cost_center_id: number;
       new_item_name: string | null;
       new_item_description: string | null;
-    }>("SELECT * FROM dbo.purchase_requests WHERE id = @id", { id }, transaction);
+    }>("SELECT * FROM purchase_requests WHERE id = @id", { id }, transaction);
     const request = requests[0];
     if (!request) return false;
 
@@ -602,7 +600,7 @@ app.patch("/api/requests/:id/review", requireAuth, requireRole("coordenacao"), a
         new_item_description: string | null;
       }>(
         `SELECT id, new_item_name, new_item_description
-         FROM dbo.purchase_request_items
+         FROM purchase_request_items
          WHERE request_id = @id AND item_type = 'novo' AND catalog_item_id IS NULL`,
         { id },
         transaction,
@@ -610,9 +608,9 @@ app.patch("/api/requests/:id/review", requireAuth, requireRole("coordenacao"), a
       for (const item of newItems) {
         const code = `NOVO-${String(id).padStart(5, "0")}-${item.id}`;
         const catalogResult = await query<{ id: number }>(
-          `INSERT INTO dbo.catalog_items (code, description, cost_center_id, source)
-           OUTPUT INSERTED.id
-           VALUES (@code, @description, @costCenterId, N'coordenacao')`,
+          `INSERT INTO catalog_items (code, description, cost_center_id, source)
+           VALUES (@code, @description, @costCenterId, 'coordenacao')
+           RETURNING id`,
           {
             code,
             description: item.new_item_description ?? item.new_item_name,
@@ -621,13 +619,13 @@ app.patch("/api/requests/:id/review", requireAuth, requireRole("coordenacao"), a
           transaction,
         );
         await query(
-          "UPDATE dbo.purchase_request_items SET catalog_item_id = @catalogItemId WHERE id = @itemId",
+          "UPDATE purchase_request_items SET catalog_item_id = @catalogItemId WHERE id = @itemId",
           { catalogItemId: catalogResult[0].id, itemId: item.id },
           transaction,
         );
         if (request.item_type === "novo" && !request.catalog_item_id) {
           await query(
-            "UPDATE dbo.purchase_requests SET catalog_item_id = @catalogItemId WHERE id = @id",
+            "UPDATE purchase_requests SET catalog_item_id = @catalogItemId WHERE id = @id",
             { catalogItemId: catalogResult[0].id, id },
             transaction,
           );
@@ -637,14 +635,14 @@ app.patch("/api/requests/:id/review", requireAuth, requireRole("coordenacao"), a
     }
 
     await query(
-      `UPDATE dbo.purchase_requests
-       SET status = @status, coordinator_response = @response, updated_at = SYSDATETIME()
+      `UPDATE purchase_requests
+       SET status = @status, coordinator_response = @response, updated_at = NOW()
        WHERE id = @id`,
       { status, response, id },
       transaction,
     );
     await query(
-      `INSERT INTO dbo.notifications (user_id, title, message)
+      `INSERT INTO notifications (user_id, title, message)
        VALUES (@userId, @title, @message)`,
       {
         userId: request.professor_id,
@@ -666,8 +664,8 @@ app.patch("/api/requests/:id/review", requireAuth, requireRole("coordenacao"), a
 
 app.get("/api/notifications", requireAuth, async (req, res) => {
   const rows = await query(
-    `SELECT id, title, message, read_at AS readAt, created_at AS createdAt
-     FROM dbo.notifications WHERE user_id = @userId ORDER BY created_at DESC`,
+    `SELECT id, title, message, read_at AS "readAt", created_at AS "createdAt"
+     FROM notifications WHERE user_id = @userId ORDER BY created_at DESC`,
     { userId: req.user?.id },
   );
   res.json(rows);
@@ -675,7 +673,7 @@ app.get("/api/notifications", requireAuth, async (req, res) => {
 
 app.patch("/api/notifications/read-all", requireAuth, async (req, res) => {
   await query(
-    "UPDATE dbo.notifications SET read_at = SYSDATETIME() WHERE user_id = @userId AND read_at IS NULL",
+    "UPDATE notifications SET read_at = NOW() WHERE user_id = @userId AND read_at IS NULL",
     { userId: req.user?.id },
   );
   res.json({ ok: true });
@@ -683,7 +681,7 @@ app.patch("/api/notifications/read-all", requireAuth, async (req, res) => {
 
 app.patch("/api/notifications/:id/read", requireAuth, async (req, res) => {
   await query(
-    "UPDATE dbo.notifications SET read_at = SYSDATETIME() WHERE id = @id AND user_id = @userId",
+    "UPDATE notifications SET read_at = NOW() WHERE id = @id AND user_id = @userId",
     { id: req.params.id, userId: req.user?.id },
   );
   res.json({ ok: true });
@@ -735,6 +733,9 @@ function validateManagedUser(body: unknown, requirePassword: boolean):
 function isUniqueConstraintError(error: unknown) {
   if (!error || typeof error !== "object") return false;
 
+  const postgresError = error as { code?: string };
+  if (postgresError.code === "23505") return true;
+
   const sqlError = error as { number?: number; originalError?: { info?: { number?: number } } };
   const number = sqlError.number ?? sqlError.originalError?.info?.number;
   return number === 2601 || number === 2627;
@@ -767,10 +768,22 @@ function isAllowedDevOrigin(origin: string) {
   }
 }
 
+function isAllowedConfiguredOrigin(origin: string) {
+  return configuredOrigins.some((allowedOrigin) => {
+    if (allowedOrigin === origin) return true;
+    if (!allowedOrigin.includes("*")) return false;
+
+    const pattern = allowedOrigin
+      .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+      .replaceAll("\\*", ".*");
+    return new RegExp(`^${pattern}$`).test(origin);
+  });
+}
+
 async function saveAttachment(requestId: number, file: Express.Multer.File | undefined, kind: "ficha_tecnica" | "foto") {
   if (!file) return;
   await query(
-    `INSERT INTO dbo.request_attachments (request_id, kind, original_name, stored_path)
+    `INSERT INTO request_attachments (request_id, kind, original_name, stored_path)
      VALUES (@requestId, @kind, @originalName, @storedPath)`,
     { requestId, kind, originalName: file.originalname, storedPath: file.filename },
   );

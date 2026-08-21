@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: compras-senai-api
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: compras-senai-db
+          property: connectionString
+      - key: DB_SSL
+        value: "true"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: FRONTEND_URL
+        value: https://compras-senai-1.onrender.com
+      - key: CORS_ORIGINS
+        value: https://*.onrender.com,https://compras-senai-1.onrender.com,https://compras-senai.onrender.com
+
+  - type: web
+    name: compras-senai
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install --include=dev && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        value: https://compras-senai-api.onrender.com/api
+
+databases:
+  - name: compras-senai-db
+    databaseName: compras_senai
+    user: compras_senai
+    plan: free
