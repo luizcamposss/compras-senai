@@ -7,6 +7,8 @@ import ExcelJS from "exceljs";
 import { mkdirSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { extname, join } from "node:path";
+import { Readable } from "node:stream";
+import { TextDecoder } from "node:util";
 import { requireAuth, requireRole, signToken } from "./auth.js";
 import { initDatabase, query, withTransaction } from "./db.js";
 import { assertAllowedSupplierLink, assertRequiredText, parsePositiveInt } from "./validators.js";
@@ -319,15 +321,21 @@ app.get("/api/cost-centers", requireAuth, async (_req, res) => {
 app.get("/api/catalog", requireAuth, async (req, res) => {
   const search = String(req.query.search ?? "").trim();
   const like = `%${search}%`;
+  const requestedLimit = Number(req.query.limit);
+  const requestedOffset = Number(req.query.offset);
+  const paginated = Number.isInteger(requestedLimit) || Number.isInteger(requestedOffset);
+  const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 200) : 40;
+  const offset = Number.isInteger(requestedOffset) ? Math.max(requestedOffset, 0) : 0;
   const rows = await query(
     `SELECT ci.id, ci.code, ci.description, ci.source,
             cc.code AS "costCenterCode", cc.name AS "costCenterName"
      FROM catalog_items ci
      LEFT JOIN cost_centers cc ON cc.id = ci.cost_center_id
      WHERE @search = '' OR ci.code ILIKE @like OR ci.description ILIKE @like
-     ORDER BY ci.description
-     LIMIT 40`,
-    { search, like },
+     ORDER BY ci.description, ci.id
+     LIMIT @limit
+     ${paginated ? "OFFSET @offset" : ""}`,
+    { search, like, offset, limit },
   );
   res.json(rows);
 });
@@ -365,6 +373,7 @@ app.post("/api/catalog/import", requireAuth, requireRole("coordenacao"), upload.
   try {
     const parsed = await parseCatalogFile(req.file.path, req.file.originalname);
     await withTransaction(async (transaction) => {
+      await query("UPDATE purchase_request_items SET catalog_item_id = NULL WHERE catalog_item_id IS NOT NULL", {}, transaction);
       await query("UPDATE purchase_requests SET catalog_item_id = NULL WHERE catalog_item_id IS NOT NULL", {}, transaction);
       await query("DELETE FROM catalog_items", {}, transaction);
       for (const item of parsed.items) {
@@ -391,7 +400,7 @@ app.post("/api/catalog/import", requireAuth, requireRole("coordenacao"), upload.
 app.get("/api/requests", requireAuth, async (req, res) => {
   const filter = req.user?.role === "professor" ? "WHERE pr.professor_id = @professorId" : "";
   const params = req.user?.role === "professor" ? { professorId: req.user.id } : {};
-  const rows = await query(
+  const rows = await query<Record<string, unknown> & { id: number }>(
     `SELECT pr.*, u.name AS "professorName", ci.code AS "catalogCode", ci.description AS "catalogDescription",
             cc.code AS "costCenterCode", cc.name AS "costCenterName"
      FROM purchase_requests pr
@@ -402,7 +411,52 @@ app.get("/api/requests", requireAuth, async (req, res) => {
      ORDER BY pr.created_at DESC`,
     params,
   );
-  res.json(rows);
+  const itemRows = await query<{
+    id: number;
+    requestId: number;
+    item_type: "catalogo" | "novo";
+    quantity: number;
+    catalogItemId: number | null;
+    catalogCode: string | null;
+    catalogDescription: string | null;
+    new_item_name: string | null;
+    new_item_description: string | null;
+    supplier_link: string | null;
+  }>(
+    `SELECT pri.id, pri.request_id AS "requestId", pri.item_type, pri.quantity,
+            pri.catalog_item_id AS "catalogItemId", ci.code AS "catalogCode",
+            ci.description AS "catalogDescription", pri.new_item_name,
+            pri.new_item_description, pri.supplier_link
+     FROM purchase_request_items pri
+     JOIN purchase_requests pr ON pr.id = pri.request_id
+     LEFT JOIN catalog_items ci ON ci.id = pri.catalog_item_id
+     ${filter}
+     ORDER BY pri.id`,
+    params,
+  );
+  const itemsByRequest = new Map<number, Array<(typeof itemRows)[number]>>();
+  for (const item of itemRows) {
+    const requestItems = itemsByRequest.get(item.requestId) ?? [];
+    requestItems.push(item);
+    itemsByRequest.set(item.requestId, requestItems);
+  }
+
+  res.json(rows.map((request) => {
+    const storedItems = itemsByRequest.get(request.id);
+    const legacyItem = {
+      id: 0,
+      requestId: request.id,
+      item_type: request.item_type,
+      quantity: request.quantity,
+      catalogItemId: request.catalog_item_id,
+      catalogCode: request.catalogCode,
+      catalogDescription: request.catalogDescription,
+      new_item_name: request.new_item_name,
+      new_item_description: request.new_item_description,
+      supplier_link: request.supplier_link,
+    };
+    return { ...request, items: storedItems?.length ? storedItems : [legacyItem] };
+  }));
 });
 
 app.post(
@@ -411,21 +465,55 @@ app.post(
   requireRole("professor"),
   async (req, res) => {
     try {
-      const catalogItemId = parsePositiveInt(req.body.catalogItemId, "Item do catalogo");
+      const rawItems: unknown[] = Array.isArray(req.body.items)
+        ? req.body.items
+        : [{ catalogItemId: req.body.catalogItemId, quantity: req.body.quantity }];
+      if (rawItems.length === 0 || rawItems.length > 50) {
+        throw new Error("O pedido deve conter entre 1 e 50 produtos.");
+      }
+      const items = rawItems.map((item: unknown) => {
+        const fields = item && typeof item === "object" ? item as Record<string, unknown> : {};
+        return {
+          catalogItemId: parsePositiveInt(fields.catalogItemId, "Item do catalogo"),
+          quantity: parseRequestQuantity(fields.quantity),
+        };
+      });
+      if (new Set(items.map((item) => item.catalogItemId)).size !== items.length) {
+        throw new Error("O mesmo produto nao pode aparecer mais de uma vez no pedido.");
+      }
       const costCenterId = parsePositiveInt(req.body.costCenterId, "Centro de custo");
-      const quantity = parsePositiveInt(req.body.quantity, "Quantidade");
       const justification = assertRequiredText(req.body.justification, "Justificativa");
+      const firstItem = items[0];
 
-      const result = await query<{ id: number }>(
-        `INSERT INTO purchase_requests
-         (professor_id, catalog_item_id, cost_center_id, item_type, quantity, justification, status)
-         VALUES (@professorId, @catalogItemId, @costCenterId, 'catalogo', @quantity, @justification, 'aguardando_coordenacao')
-         RETURNING id`,
-        { professorId: req.user?.id, catalogItemId, costCenterId, quantity, justification },
-      );
+      const requestId = await withTransaction(async (transaction) => {
+        const result = await query<{ id: number }>(
+          `INSERT INTO purchase_requests
+           (professor_id, catalog_item_id, cost_center_id, item_type, quantity, justification, status)
+           VALUES (@professorId, @catalogItemId, @costCenterId, 'catalogo', @quantity, @justification, 'aguardando_coordenacao')
+           RETURNING id`,
+          {
+            professorId: req.user?.id,
+            catalogItemId: firstItem.catalogItemId,
+            costCenterId,
+            quantity: firstItem.quantity,
+            justification,
+          },
+          transaction,
+        );
+        for (const item of items) {
+          await query(
+            `INSERT INTO purchase_request_items
+             (request_id, catalog_item_id, item_type, quantity)
+             VALUES (@requestId, @catalogItemId, 'catalogo', @quantity)`,
+            { requestId: result[0].id, ...item },
+            transaction,
+          );
+        }
+        return result[0].id;
+      });
 
       res.status(201).json({
-        id: result[0].id,
+        id: requestId,
         message: "Solicitacao enviada. Aguarde retorno em ate 30 dias.",
       });
     } catch (error) {
@@ -445,7 +533,7 @@ app.post(
   async (req, res) => {
     try {
       const costCenterId = parsePositiveInt(req.body.costCenterId, "Centro de custo");
-      const quantity = parsePositiveInt(req.body.quantity, "Quantidade");
+      const quantity = parseRequestQuantity(req.body.quantity);
       const justification = assertRequiredText(req.body.justification, "Justificativa");
       const newItemName = assertRequiredText(req.body.newItemName, "Nome do produto");
       const newItemDescription = assertRequiredText(req.body.newItemDescription, "Descricao do produto");
@@ -462,6 +550,12 @@ app.post(
       );
 
       const requestId = result[0].id;
+      await query(
+        `INSERT INTO purchase_request_items
+         (request_id, item_type, quantity, new_item_name, new_item_description, supplier_link)
+         VALUES (@requestId, 'novo', @quantity, @newItemName, @newItemDescription, @supplierLink)`,
+        { requestId, quantity, newItemName, newItemDescription, supplierLink },
+      );
       const files = req.files as Record<string, Express.Multer.File[]>;
       await saveAttachment(requestId, files?.technicalFile?.[0], "ficha_tecnica");
       await saveAttachment(requestId, files?.photo?.[0], "foto");
@@ -499,24 +593,45 @@ app.patch("/api/requests/:id/review", requireAuth, requireRole("coordenacao"), a
     const request = requests[0];
     if (!request) return false;
 
-    if (status === "aprovada" && request.item_type === "novo" && !request.catalog_item_id) {
-      const code = `NOVO-${String(id).padStart(5, "0")}`;
-      const catalogResult = await query<{ id: number }>(
-        `INSERT INTO catalog_items (code, description, cost_center_id, source)
-         VALUES (@code, @description, @costCenterId, 'coordenacao')
-         RETURNING id`,
-        {
-          code,
-          description: request.new_item_description ?? request.new_item_name,
-          costCenterId: request.cost_center_id,
-        },
+    if (status === "aprovada") {
+      const newItems = await query<{
+        id: number;
+        new_item_name: string | null;
+        new_item_description: string | null;
+      }>(
+        `SELECT id, new_item_name, new_item_description
+         FROM purchase_request_items
+         WHERE request_id = @id AND item_type = 'novo' AND catalog_item_id IS NULL`,
+        { id },
         transaction,
       );
-      await query(
-        "UPDATE purchase_requests SET catalog_item_id = @catalogItemId WHERE id = @id",
-        { catalogItemId: catalogResult[0].id, id },
-        transaction,
-      );
+      for (const item of newItems) {
+        const code = `NOVO-${String(id).padStart(5, "0")}-${item.id}`;
+        const catalogResult = await query<{ id: number }>(
+          `INSERT INTO catalog_items (code, description, cost_center_id, source)
+           VALUES (@code, @description, @costCenterId, 'coordenacao')
+           RETURNING id`,
+          {
+            code,
+            description: item.new_item_description ?? item.new_item_name,
+            costCenterId: request.cost_center_id,
+          },
+          transaction,
+        );
+        await query(
+          "UPDATE purchase_request_items SET catalog_item_id = @catalogItemId WHERE id = @itemId",
+          { catalogItemId: catalogResult[0].id, itemId: item.id },
+          transaction,
+        );
+        if (request.item_type === "novo" && !request.catalog_item_id) {
+          await query(
+            "UPDATE purchase_requests SET catalog_item_id = @catalogItemId WHERE id = @id",
+            { catalogItemId: catalogResult[0].id, id },
+            transaction,
+          );
+          request.catalog_item_id = catalogResult[0].id;
+        }
+      }
     }
 
     await query(
@@ -579,6 +694,12 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
 
 function isValidEmail(email: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function parseRequestQuantity(value: unknown) {
+  const quantity = parsePositiveInt(value, "Quantidade");
+  if (quantity > 50) throw new Error("A quantidade maxima por produto e 50.");
+  return quantity;
 }
 
 function validateManagedUser(body: unknown, requirePassword: boolean):
@@ -679,11 +800,11 @@ async function parseCatalogFile(path: string, originalName: string): Promise<Cat
 
   try {
     if (extension === ".csv") {
-      const content = await readFile(path, "utf8");
+      const content = decodeCsvContent(await readFile(path));
       if (!content.trim()) throw new CatalogFileError("Arquivo vazio.");
       if (content.includes("\0")) throw new CatalogFileError("Nao foi possivel interpretar o arquivo CSV.");
       const delimiter = detectCsvDelimiter(content);
-      worksheet = await workbook.csv.readFile(path, { parserOptions: { delimiter } });
+      worksheet = await workbook.csv.read(Readable.from([content]), { parserOptions: { delimiter } });
     } else {
       await workbook.xlsx.readFile(path);
       worksheet = workbook.worksheets[0];
@@ -702,28 +823,40 @@ async function parseCatalogFile(path: string, originalName: string): Promise<Cat
   return parseCatalogWorksheet(worksheet);
 }
 
+function decodeCsvContent(content: Buffer) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch {
+    return new TextDecoder("windows-1252").decode(content);
+  }
+}
+
 function parseCatalogWorksheet(worksheet: ExcelJS.Worksheet): CatalogParseResult {
   const codeAliases = new Set(["codigo", "cod", "code", "item", "cod_item", "codigo_item"]);
   const descriptionAliases = new Set(["descricao", "description", "nome", "produto", "item_descricao"]);
   let headerRowNumber = 0;
+  let codeIndex = 0;
+  let descriptionIndex = 0;
+  let hasContent = false;
 
   for (let rowNumber = 1; rowNumber <= Math.min(worksheet.rowCount, 20); rowNumber += 1) {
     const row = worksheet.getRow(rowNumber);
-    if (rowHasContent(row)) {
+    if (!rowHasContent(row)) continue;
+    hasContent = true;
+    const normalizedHeaders = Array.from({ length: row.cellCount }, (_, index) => (
+      normalizeKey(row.getCell(index + 1).text)
+    ));
+    const foundCodeIndex = normalizedHeaders.findIndex((header) => codeAliases.has(header)) + 1;
+    const foundDescriptionIndex = normalizedHeaders.findIndex((header) => descriptionAliases.has(header)) + 1;
+    if (foundCodeIndex && foundDescriptionIndex && foundCodeIndex !== foundDescriptionIndex) {
       headerRowNumber = rowNumber;
+      codeIndex = foundCodeIndex;
+      descriptionIndex = foundDescriptionIndex;
       break;
     }
   }
-  if (!headerRowNumber) throw new CatalogFileError("Arquivo vazio.");
-
-  const headerRow = worksheet.getRow(headerRowNumber);
-  const normalizedHeaders = Array.from({ length: headerRow.cellCount }, (_, index) => (
-    normalizeKey(headerRow.getCell(index + 1).text)
-  ));
-  const codeIndex = normalizedHeaders.findIndex((header) => codeAliases.has(header)) + 1;
-  const descriptionIndex = normalizedHeaders.findIndex((header) => descriptionAliases.has(header)) + 1;
-
-  if (!codeIndex || !descriptionIndex || codeIndex === descriptionIndex) {
+  if (!headerRowNumber && !hasContent) throw new CatalogFileError("Arquivo vazio.");
+  if (!headerRowNumber) {
     throw new CatalogFileError("Nao foi possivel identificar as colunas Codigo e Descricao.");
   }
 
